@@ -6,7 +6,7 @@ adjacent temporal bins by centroid distance before filtering short tracks.
 Neither module changes scores during training and both are disabled by default.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -133,6 +133,9 @@ class P18ScoreTrackRecoveryConfig:
     min_track_bins: int = 2
     restore_mode: str = 'best'
     max_restore_events_per_component: int = 0
+    velocity_gate_enabled: bool = False
+    velocity_gate_base_link_distance: float = 6.0
+    velocity_gate_max_acceleration: float = 3.0
 
     def __post_init__(self):
         if self.event_count_cutoff <= 0:
@@ -159,6 +162,19 @@ class P18ScoreTrackRecoveryConfig:
             raise ValueError(
                 'p18_max_restore_events_per_component must be non-negative.'
             )
+        if self.velocity_gate_base_link_distance < 0:
+            raise ValueError(
+                'p18_velocity_gate_base_link_distance must be >= 0.'
+            )
+        if self.velocity_gate_base_link_distance > self.max_link_distance:
+            raise ValueError(
+                'p18_velocity_gate_base_link_distance cannot exceed '
+                'p18_max_link_distance.'
+            )
+        if self.velocity_gate_max_acceleration < 0:
+            raise ValueError(
+                'p18_velocity_gate_max_acceleration must be >= 0.'
+            )
         if self.restore_mode == 'topk' and self.max_restore_events_per_component < 1:
             raise ValueError(
                 'p18_max_restore_events_per_component must be positive when '
@@ -182,6 +198,15 @@ class P18ScoreTrackRecoveryConfig:
             restore_mode=str(getattr(cfg, 'p18_restore_mode', 'best')),
             max_restore_events_per_component=int(
                 getattr(cfg, 'p18_max_restore_events_per_component', 0)
+            ),
+            velocity_gate_enabled=_as_bool(
+                getattr(cfg, 'p18_velocity_gate_enabled', False)
+            ),
+            velocity_gate_base_link_distance=float(
+                getattr(cfg, 'p18_velocity_gate_base_link_distance', 6.0)
+            ),
+            velocity_gate_max_acceleration=float(
+                getattr(cfg, 'p18_velocity_gate_max_acceleration', 3.0)
             ),
         )
 
@@ -831,7 +856,34 @@ class P0bTrackFilter:
         return filtered_predictions.reshape_as(predictions), stats
 
 
-def _recover_one_video_by_score_tracks(
+def _track_passes_velocity_gate(track, config):
+    """Keep normal P18 tracks; vet only links beyond the base distance."""
+    if not config.velocity_gate_enabled:
+        return True
+
+    components = track['components']
+    centers = np.asarray(
+        [component['centroid'] for component in components],
+        dtype=np.float64,
+    )
+    bins = np.asarray(
+        [component['temporal_bin'] for component in components],
+        dtype=np.float64,
+    )
+    time_deltas = np.diff(bins)
+    velocities = np.diff(centers, axis=0) / time_deltas[:, None]
+    speeds = np.linalg.norm(velocities, axis=1)
+    if not (speeds > config.velocity_gate_base_link_distance).any():
+        return True
+    if velocities.shape[0] < 2:
+        return False
+    accelerations = np.linalg.norm(np.diff(velocities, axis=0), axis=1)
+    return bool(
+        np.all(accelerations <= config.velocity_gate_max_acceleration)
+    )
+
+
+def _recover_one_video_by_score_tracks_core(
     prediction_scores,
     coordinates,
     config,
@@ -882,6 +934,7 @@ def _recover_one_video_by_score_tracks(
             config.spatial_radius,
         )
         for component in components:
+            component['temporal_bin'] = int(temporal_bin)
             component_scores = prediction_scores[component['event_indices']]
             score_order = np.argsort(component_scores)[::-1]
             component['sorted_event_indices'] = component['event_indices'][score_order]
@@ -937,6 +990,8 @@ def _recover_one_video_by_score_tracks(
             and track['frame_count'] >= config.min_track_bins
         ):
             continue
+        if not _track_passes_velocity_gate(track, config):
+            continue
         stats.supported_tracks += 1
         for component in track['components']:
             if component['has_seed']:
@@ -961,6 +1016,54 @@ def _recover_one_video_by_score_tracks(
     stats.restored_events = int(recovery_mask.sum())
     stats.output_positive_events += stats.restored_events
     return recovery_mask, stats
+
+
+def _recover_one_video_by_score_tracks(
+    prediction_scores,
+    coordinates,
+    config,
+    prediction_threshold,
+):
+    """Recover normal P18 tracks plus optional, gated high-speed tracks."""
+    if (
+        not config.velocity_gate_enabled
+        or config.max_link_distance <= config.velocity_gate_base_link_distance
+    ):
+        return _recover_one_video_by_score_tracks_core(
+            prediction_scores,
+            coordinates,
+            config,
+            prediction_threshold,
+        )
+
+    # A wider greedy matching radius can merge a normal short track into an
+    # unrelated long link. Keep the production-radius result as an immutable
+    # base and add only gated wide-radius recoveries on top of it.
+    base_config = replace(
+        config,
+        velocity_gate_enabled=False,
+        max_link_distance=config.velocity_gate_base_link_distance,
+    )
+    base_mask, base_stats = _recover_one_video_by_score_tracks_core(
+        prediction_scores,
+        coordinates,
+        base_config,
+        prediction_threshold,
+    )
+    extended_mask, extended_stats = _recover_one_video_by_score_tracks_core(
+        prediction_scores,
+        coordinates,
+        config,
+        prediction_threshold,
+    )
+    recovery_mask = base_mask | extended_mask
+    extended_stats.restored_components = int(recovery_mask.sum())
+    extended_stats.restored_events = int(recovery_mask.sum())
+    extended_stats.input_positive_events = base_stats.input_positive_events
+    extended_stats.output_positive_events = (
+        extended_stats.input_positive_events + extended_stats.restored_events
+    )
+    return recovery_mask, extended_stats
 
 
 def recover_seed_supported_track_events(
@@ -1040,7 +1143,9 @@ class P18ScoreTrackRecovery:
         return (
             'enabled (event_count > {} and <= {}, candidate_floor={}, spatial_radius={}, '
             'temporal_bin_size={}, max_link_distance={}, max_gap_bins={}, '
-            'min_track_bins={}, restore_mode={}, max_restore_events_per_component={})'
+            'min_track_bins={}, restore_mode={}, max_restore_events_per_component={}, '
+            'velocity_gate_enabled={}, velocity_gate_base_link_distance={}, '
+            'velocity_gate_max_acceleration={})'
         ).format(
             self.config.event_count_cutoff,
             self.config.max_event_count or 'unbounded',
@@ -1052,6 +1157,9 @@ class P18ScoreTrackRecovery:
             self.config.min_track_bins,
             self.config.restore_mode,
             self.config.max_restore_events_per_component,
+            self.config.velocity_gate_enabled,
+            self.config.velocity_gate_base_link_distance,
+            self.config.velocity_gate_max_acceleration,
         )
 
     def apply(self, predictions, locations):

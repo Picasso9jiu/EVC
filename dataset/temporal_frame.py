@@ -102,6 +102,45 @@ def temporal_frame_video_from_events(
     )
 
 
+def temporal_phase_shift_temporal_frame_video(
+    video,
+    temporal_bin_size,
+    phase_offset,
+):
+    """Re-index a full stream on a nonzero intra-bin time phase.
+
+    Event order, coordinates, labels, and target IDs remain aligned. Only the
+    time coordinate used for frame formation is translated. The added tail
+    bin intentionally matches P41 inference, so a phase expert trains on the
+    same input view it receives at evaluation time.
+    """
+    if not isinstance(video, TemporalFrameVideo):
+        raise TypeError('video must be a TemporalFrameVideo.')
+    temporal_bin_size = int(temporal_bin_size)
+    phase_offset = int(phase_offset)
+    if temporal_bin_size <= 0:
+        raise ValueError('temporal_bin_size must be positive.')
+    if phase_offset <= 0 or phase_offset >= temporal_bin_size:
+        raise ValueError('phase_offset must be in [1, temporal_bin_size - 1].')
+    shifted_locations = video.locations.copy()
+    shifted_locations[:, 2] += phase_offset
+    shifted_whole_t = temporal_bin_size * len(video.event_indices_by_bin) + phase_offset
+    if shifted_locations.size:
+        shifted_whole_t = max(
+            shifted_whole_t,
+            int(shifted_locations[:, 2].max()) + 1,
+        )
+    return temporal_frame_video_from_events(
+        name=video.name,
+        locations=shifted_locations,
+        polarities=video.polarities,
+        temporal_bin_size=temporal_bin_size,
+        whole_t=shifted_whole_t,
+        labels=video.labels,
+        target_ids=video.target_ids,
+    )
+
+
 def load_temporal_frame_video(path, temporal_bin_size, whole_t):
     """Load an EV-UAV npz file and index its events by metric-time bins."""
     path = Path(path)
@@ -130,6 +169,8 @@ def build_temporal_context_frame(
     log_count_clip=4.0,
     local_contrast_enabled=False,
     local_contrast_kernel_size=9,
+    local_temporal_context_enabled=False,
+    local_temporal_context_kernel_size=11,
 ):
     """Build a normalized polarity-count frame stack centred on one time bin.
 
@@ -184,14 +225,32 @@ def build_temporal_context_frame(
         )
         np.add.at(frame.reshape(-1), flat_indices, 1.0)
 
+    local_temporal_context = None
+    if local_temporal_context_enabled:
+        valid_neighbour_bins = sum(
+            1
+            for relative_bin in range(-half_context, half_context + 1)
+            if relative_bin != 0
+            and 0 <= center_bin + relative_bin < len(video.event_indices_by_bin)
+        )
+        local_temporal_context = build_local_temporal_context_channel(
+            frame,
+            context_bins,
+            local_temporal_context_kernel_size,
+            log_count_clip,
+            valid_neighbour_bins=valid_neighbour_bins,
+        )
+
     np.log1p(frame, out=frame)
     np.minimum(frame, log_count_clip, out=frame)
     frame /= log_count_clip
     if local_contrast_enabled:
-        return append_local_density_contrast(
+        frame = append_local_density_contrast(
             frame,
             local_contrast_kernel_size,
         )
+    if local_temporal_context is not None:
+        frame = np.concatenate((frame, local_temporal_context), axis=0)
     return frame
 
 
@@ -231,6 +290,77 @@ def append_local_density_contrast(frame, kernel_size=9):
     frame = np.asarray(frame, dtype=np.float32)
     local_mean = _local_box_mean(frame, kernel_size)
     return np.concatenate((frame, frame - local_mean), axis=0)
+
+
+def build_local_temporal_context_channel(
+    raw_frame,
+    context_bins,
+    kernel_size=11,
+    log_count_clip=4.0,
+    valid_neighbour_bins=None,
+):
+    """Return local activity from the non-centre temporal context bins.
+
+    The main event frame preserves its existing polarity-count inputs.  This
+    optional one-channel feature instead measures how much *nearby* activity
+    occurs at the same location in the two preceding and two following bins.
+    It is built before log clipping so a persistent high-rate background is
+    distinguishable even when the centre-bin event count is identical.
+    """
+    raw_frame = np.asarray(raw_frame, dtype=np.float32)
+    context_bins = int(context_bins)
+    kernel_size = int(kernel_size)
+    log_count_clip = float(log_count_clip)
+    if raw_frame.ndim != 3 or raw_frame.shape[0] != context_bins * 2:
+        raise ValueError(
+            'raw_frame must have shape [context_bins * 2, H, W].'
+        )
+    if context_bins < 3 or context_bins % 2 == 0:
+        raise ValueError('context_bins must be an odd integer of at least three.')
+    if kernel_size <= 0 or kernel_size % 2 == 0:
+        raise ValueError(
+            'local_temporal_context_kernel_size must be a positive odd integer.'
+        )
+    if log_count_clip <= 0.0:
+        raise ValueError('log_count_clip must be positive.')
+
+    centre_start = (context_bins // 2) * 2
+    neighbour_activity = raw_frame.sum(axis=0, keepdims=True).copy()
+    neighbour_activity -= raw_frame[centre_start:centre_start + 2].sum(
+        axis=0,
+        keepdims=True,
+    )
+    if valid_neighbour_bins is None:
+        valid_neighbour_bins = context_bins - 1
+    valid_neighbour_bins = int(valid_neighbour_bins)
+    if valid_neighbour_bins <= 0 or valid_neighbour_bins > context_bins - 1:
+        raise ValueError(
+            'valid_neighbour_bins must be in [1, context_bins - 1].'
+        )
+    # M71 measures the mean activity over the *available* neighbouring bins.
+    # Constant padding keeps the spatial border consistent with that diagnostic:
+    # out-of-image pixels are absent rather than replicated.
+    radius = kernel_size // 2
+    padded = np.pad(
+        neighbour_activity,
+        ((0, 0), (radius, radius), (radius, radius)),
+        mode='constant',
+    )
+    integral = np.pad(
+        np.cumsum(np.cumsum(padded, axis=1), axis=2),
+        ((0, 0), (1, 0), (1, 0)),
+        mode='constant',
+    )
+    local_sum = (
+        integral[:, kernel_size:, kernel_size:]
+        - integral[:, :-kernel_size, kernel_size:]
+        - integral[:, kernel_size:, :-kernel_size]
+        + integral[:, :-kernel_size, :-kernel_size]
+    )
+    local_sum /= float(valid_neighbour_bins)
+    np.log1p(local_sum, out=local_sum)
+    np.minimum(local_sum, log_count_clip, out=local_sum)
+    return local_sum / log_count_clip
 
 
 def temporal_frame_view_schedule(

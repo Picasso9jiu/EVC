@@ -116,6 +116,34 @@ TEST:
   # Output directory for submit_challenge2.py val_*.txt files.
   challenge_output_dir: ""
 
+INFERENCE_TTA:
+  # P14/M37: label-free horizontal-flip score averaging before P6 and P0.
+  # Disabled by default so existing full-stream evaluation is unchanged.
+  p14_horizontal_flip_enabled: false
+  p14_horizontal_flip_original_weight: 1.0
+  # P41: score-average an alternate time grid shifted within one 50-unit bin.
+  p41_temporal_phase_enabled: false
+  p41_temporal_phase_offset: 25
+  p41_temporal_phase_original_weight: 1.0
+  p41_temporal_phase_min_event_count: 0
+  p41_temporal_phase_average_mode: probability
+  # M53: automatically use the shifted view more near raw time-bin boundaries.
+  p41_temporal_phase_boundary_adaptive: false
+  # M54: average a complete time-reversed bidirectional-memory view.
+  p54_temporal_reverse_enabled: false
+  p54_temporal_reverse_original_weight: 1.0
+  p54_temporal_reverse_min_event_count: 0
+  # P50: evenly distribute P41's alternate-view mass over three time phases.
+  # Disabled by default so the established P41 production path is unchanged.
+  p50_temporal_multiphase_enabled: false
+  p50_temporal_multiphase_offsets: [12, 25, 37]
+  p50_temporal_multiphase_original_weight: 0.75
+  p50_temporal_multiphase_min_event_count: 0
+  # P44: average all one-pixel spatial grid phases before postprocessing.
+  p44_spatial_phase_enabled: false
+  p44_spatial_phase_offset: 1
+  p44_spatial_phase_min_event_count: 0
+
 POSTPROCESS:
   # P0: disabled by default; enable with --set POSTPROCESS.p0_enabled=true
   p0_enabled: false
@@ -150,6 +178,10 @@ POSTPROCESS:
   p18_restore_mode: best
   # 0 means no component cap when restore_mode=component.
   p18_max_restore_events_per_component: 0
+  # M28: gate only supra-base P18 links by constant-velocity consistency.
+  p18_velocity_gate_enabled: false
+  p18_velocity_gate_base_link_distance: 6.0
+  p18_velocity_gate_max_acceleration: 3.0
   # P6: density-adaptive decision threshold; disabled by default.
   p6_density_threshold_enabled: false
   p6_event_count_cutoff: 100000
@@ -260,6 +292,43 @@ TEMPORAL_MEMORY:
   temporal_memory_dense_sampling_enabled: false
   temporal_memory_dense_event_count_cutoff: 200000
   temporal_memory_dense_view_multiplier: 2
+  # M32: add views only for the observable middle-density regime.
+  temporal_memory_mid_density_sampling_enabled: false
+  temporal_memory_mid_density_min_event_count: 30000
+  temporal_memory_mid_density_max_event_count: 200000
+  temporal_memory_mid_density_view_multiplier: 2
+  # M30: train a separate expert only on videos above this event density.
+  temporal_memory_dense_only_enabled: false
+  temporal_memory_dense_only_event_count_cutoff: 100000
+  # M61: isolate a low-density expert without changing the high-density path.
+  temporal_memory_low_density_only_enabled: false
+  temporal_memory_low_density_only_event_count_cutoff: 30000
+  temporal_memory_max_videos_per_epoch: 0
+  temporal_memory_hard_negative_enabled: false
+  temporal_memory_hard_negative_weight: 0.02
+  temporal_memory_hard_negative_score_floor: 0.50
+  # M31: increase training views containing fast labelled targets.
+  temporal_memory_motion_sampling_enabled: false
+  temporal_memory_motion_sampling_min_event_count: 30000
+  temporal_memory_motion_sampling_min_displacement: 4.0
+  temporal_memory_motion_sampling_probability: 0.50
+  temporal_memory_motion_sampling_extra_views_only: true
+  # M87: training-only residual-velocity augmentation for labelled tracks.
+  temporal_memory_trajectory_augmentation_enabled: false
+  temporal_memory_trajectory_augmentation_min_event_count: 30000
+  temporal_memory_trajectory_augmentation_probability: 0.50
+  temporal_memory_trajectory_augmentation_extra_views_only: true
+  temporal_memory_trajectory_augmentation_residual_speed: 4.0
+  temporal_memory_trajectory_augmentation_min_track_bins: 3
+  # M93: append real labelled target tracks from another training video only
+  # to extra views.  It is training-only and leaves inference unchanged.
+  temporal_memory_cross_video_copy_paste_enabled: false
+  temporal_memory_cross_video_copy_paste_min_event_count: 30000
+  temporal_memory_cross_video_copy_paste_probability: 0.25
+  temporal_memory_cross_video_copy_paste_extra_views_only: true
+  temporal_memory_cross_video_copy_paste_extra_views: 0
+  temporal_memory_cross_video_copy_paste_min_track_bins: 3
+  temporal_memory_cross_video_copy_paste_collision_radius: 1
   # Training-only loss terms aligned with Challenge 2 Pd and false components.
   temporal_memory_metric_aux_enabled: false
   temporal_memory_metric_target_weight: 0.01
@@ -271,6 +340,11 @@ TEMPORAL_MEMORY:
   temporal_memory_metric_activation_threshold: 0.70
   temporal_memory_metric_activation_temperature: 0.10
   temporal_memory_log_count_clip: 4.0
+  # M72: a zero-attached local temporal-background residual adapter.
+  temporal_memory_local_temporal_context_enabled: false
+  temporal_memory_local_temporal_context_kernel_size: 11
+  temporal_memory_local_temporal_context_lr_multiplier: 1.0
+  temporal_memory_local_temporal_context_only_enabled: false
   temporal_memory_cache_all_videos: true
   temporal_memory_cache_video_count: 16
   temporal_memory_train_workers: 0
@@ -285,14 +359,99 @@ TEMPORAL_MEMORY:
   # secondary low-density route. This supports M15/M16 high-density fusion.
   temporal_memory_blend_model_path: ""
   temporal_memory_blend_primary_weight: 1.0
+  # M30: route the dense specialist only after the event-count cutoff.
+  temporal_memory_dense_specialist_enabled: false
+  temporal_memory_dense_specialist_model_path: ""
+  temporal_memory_dense_specialist_event_count_cutoff: 100000
+  temporal_memory_dense_specialist_weight: 0.50
+  # M46: separately trained 25-unit temporal model, routed only by density.
+  temporal_memory_fine_time_expert_enabled: false
+  temporal_memory_fine_time_expert_model_path: ""
+  temporal_memory_fine_time_expert_event_count_cutoff: 30000
+  temporal_memory_fine_time_expert_weight: 0.25
+  temporal_memory_fine_time_expert_bin_size: 25
+  temporal_memory_fine_time_expert_context_bins: 5
+  temporal_memory_fine_time_expert_sequence_length: 32
+  # M49: train an otherwise identical expert on P41's shifted 50-unit grid.
+  # Disabled by default so all existing training and inference are unchanged.
+  temporal_memory_phase_specialist_enabled: false
+  temporal_memory_phase_specialist_model_path: ""
+  temporal_memory_phase_specialist_event_count_cutoff: 30000
+  temporal_memory_phase_specialist_weight: 0.25
+  temporal_memory_phase_specialist_offset: 25
   temporal_memory_init_model_path: ""
+  # Training-only P41-equivalent phase translation. Zero keeps the raw grid.
+  temporal_memory_training_phase_offset: 0
+  # M46 may reuse a same-shape memory checkpoint across temporal resolution.
+  temporal_memory_init_allow_sequence_length_transfer: false
+  temporal_memory_init_allow_temporal_bin_transfer: false
   temporal_memory_sparse_weight: 0.50
   temporal_memory_base_lr_multiplier: 1.0  # 本仓库改为 1.0（关键）：0.1 会饿死 base
   temporal_memory_memory_lr_multiplier: 1.0
+  temporal_memory_attention_lr_multiplier: 1.0
   # When a new confidence branch is attached to a released M5 checkpoint,
   # learn that branch faster while retaining the existing temporal model.
   temporal_memory_confidence_lr_multiplier: 10.0
-  # Calibration-only mode freezes the released M5 backbone and trains only
-  # the newly attached confidence head.
+  # M36: freeze the released temporal model and train only the
+  # zero-initialized residual confidence head.
   temporal_memory_confidence_only_enabled: false
   temporal_memory_temporal_attention_enabled: false
+  temporal_memory_attention_output_init_std: 0.0
+  # M24: directional, distance-aware bias for temporal self-attention.
+  temporal_memory_attention_relative_bias_enabled: false
+  temporal_memory_attention_relative_bias_max_distance: 8
+  # M25: learn bottleneck-space motion and advect ConvGRU states between bins.
+  temporal_memory_advection_alignment_enabled: false
+  temporal_memory_advection_alignment_loss_weight: 0.05
+  temporal_memory_advection_alignment_lr_multiplier: 0.5
+  # M26: target-centroid trajectory supervision for advection flow.
+  # Zero means the legacy unbounded M25 flow parameterization.
+  temporal_memory_advection_max_flow: 0.0
+  temporal_memory_advection_target_flow_enabled: false
+  temporal_memory_advection_target_flow_weight: 0.5
+  temporal_memory_advection_target_flow_huber_delta: 1.0
+  # M52: freeze M26 except its existing flow head and emphasize rapid targets.
+  temporal_memory_advection_flow_only_enabled: false
+  # M69: adapt only existing temporal-memory modules to a longer sequence.
+  temporal_memory_memory_only_enabled: false
+  temporal_memory_advection_fast_motion_threshold: 4.0
+  temporal_memory_advection_fast_motion_weight: 4.0
+  # M27: compose adjacent flow vectors over a labelled multi-bin trajectory.
+  temporal_memory_advection_trajectory_flow_enabled: false
+  temporal_memory_advection_trajectory_flow_weight: 0.15
+  temporal_memory_advection_trajectory_flow_max_hop: 2
+  # M35: H/4 motion-aligned skip memory for sub-bottleneck target movement.
+  # Disabled by default so existing M26 checkpoint inference is unchanged.
+  temporal_memory_fine_temporal_memory_enabled: false
+  temporal_memory_fine_advection_max_flow: 0.0
+  temporal_memory_fine_target_flow_enabled: false
+  temporal_memory_fine_target_flow_weight: 0.5
+  temporal_memory_fine_memory_lr_multiplier: 1.0
+  # M40: freeze the calibrated M26 path and train only the new H/4 branch.
+  temporal_memory_fine_memory_only_enabled: false
+  # M48: target-centre-specific temporal residual, independent from M35.
+  temporal_memory_target_center_enabled: false
+  temporal_memory_target_center_loss_weight: 0.05
+  temporal_memory_target_center_sigma: 2.5
+  temporal_memory_target_center_radius: 6
+  temporal_memory_target_center_positive_loss_mass: 0.20
+  temporal_memory_target_center_max_positive_weight: 512.0
+  temporal_memory_target_center_empty_loss_weight: 0.10
+  # M91: joint target-level supervision kept separate from event logits.
+  temporal_memory_target_level_enabled: false
+  temporal_memory_target_level_center_loss_weight: 0.025
+  temporal_memory_target_level_presence_loss_weight: 0.010
+  temporal_memory_target_level_velocity_loss_weight: 0.010
+  temporal_memory_target_level_center_sigma: 2.5
+  temporal_memory_target_level_center_radius: 6
+  temporal_memory_target_level_positive_loss_mass: 0.20
+  temporal_memory_target_level_max_positive_weight: 512.0
+  temporal_memory_target_level_empty_loss_weight: 0.10
+  temporal_memory_target_level_velocity_huber_delta: 2.0
+  temporal_memory_target_level_lr_multiplier: 0.5
+  temporal_memory_target_level_downsample: 4
+  temporal_memory_center_memory_enabled: false
+  temporal_memory_center_memory_channels: 4
+  temporal_memory_center_memory_downsample: 4
+  temporal_memory_center_memory_lr_multiplier: 1.0
+  temporal_memory_center_memory_only_enabled: false

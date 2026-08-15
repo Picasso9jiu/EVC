@@ -374,6 +374,130 @@ def target_center_heatmap_loss(
     }
 
 
+def target_level_presence_loss(
+    presence_logits,
+    event_time_indices,
+    labels,
+    target_ids,
+):
+    """Supervise whether each temporal view contains a labelled target.
+
+    The presence target is derived only from positive events carrying a real
+    target id.  It is intentionally a small, sequence-level auxiliary task;
+    inference never needs target ids or this output.
+    """
+    if presence_logits.ndim != 1:
+        raise ValueError('presence_logits must have shape [T].')
+    tensors = (event_time_indices, labels, target_ids)
+    if any(tensor.ndim != 1 for tensor in tensors):
+        raise ValueError('Presence inputs must be flat tensors.')
+    if not (event_time_indices.shape == labels.shape == target_ids.shape):
+        raise ValueError('Presence inputs must have matching shapes.')
+    if presence_logits.numel() <= 0:
+        return presence_logits.sum() * 0.0, {'positive_view_count': 0}
+    targets = presence_logits.new_zeros(presence_logits.shape)
+    valid = (labels > 0.5) & (target_ids.long() > 0)
+    if bool(valid.any()):
+        view_indices = event_time_indices[valid]
+        valid_views = (view_indices >= 0) & (view_indices < targets.numel())
+        targets[view_indices[valid_views]] = 1.0
+    loss = functional.binary_cross_entropy_with_logits(
+        presence_logits,
+        targets,
+    )
+    return loss, {
+        'positive_view_count': int(targets.sum().detach().item()),
+        'view_count': int(targets.numel()),
+    }
+
+
+def target_level_velocity_loss(
+    velocity_maps,
+    event_time_indices,
+    event_x,
+    event_y,
+    labels,
+    target_ids,
+    huber_delta=2.0,
+):
+    """Regress target-centre displacement between adjacent sequence views.
+
+    A target id is used only to pair labelled centres during training.  The
+    prediction is sampled at the current centre from a two-channel full
+    resolution map, making the task complementary to bottleneck flow loss.
+    """
+    if velocity_maps.ndim != 4 or velocity_maps.shape[1] != 2:
+        raise ValueError('velocity_maps must have shape [T, 2, H, W].')
+    tensors = (event_time_indices, event_x, event_y, labels, target_ids)
+    if any(tensor.ndim != 1 for tensor in tensors):
+        raise ValueError('Velocity inputs must be flat tensors.')
+    if not (
+        event_time_indices.shape
+        == event_x.shape
+        == event_y.shape
+        == labels.shape
+        == target_ids.shape
+    ):
+        raise ValueError('Velocity inputs must have matching shapes.')
+    huber_delta = float(huber_delta)
+    if huber_delta <= 0.0:
+        raise ValueError('huber_delta must be positive.')
+    valid = (labels > 0.5) & (target_ids.long() > 0)
+    terms = []
+    motion_magnitudes = []
+    pair_count = 0
+    height, width = velocity_maps.shape[-2:]
+    for time_index in range(1, velocity_maps.shape[0]):
+        previous_mask = valid & (event_time_indices == time_index - 1)
+        current_mask = valid & (event_time_indices == time_index)
+        if not bool(previous_mask.any()) or not bool(current_mask.any()):
+            continue
+        for target_id in target_ids[current_mask].unique(sorted=True):
+            previous_target = previous_mask & (target_ids == target_id)
+            current_target = current_mask & (target_ids == target_id)
+            if not bool(previous_target.any() and current_target.any()):
+                continue
+            previous_center = torch.stack((
+                event_x[previous_target].float().mean(),
+                event_y[previous_target].float().mean(),
+            ))
+            current_center = torch.stack((
+                event_x[current_target].float().mean(),
+                event_y[current_target].float().mean(),
+            ))
+            grid = torch.stack((
+                current_center[0] * (2.0 / max(width - 1, 1)) - 1.0,
+                current_center[1] * (2.0 / max(height - 1, 1)) - 1.0,
+            )).reshape(1, 1, 1, 2).to(dtype=velocity_maps.dtype)
+            predicted = functional.grid_sample(
+                velocity_maps[time_index:time_index + 1],
+                grid,
+                mode='bilinear',
+                padding_mode='border',
+                align_corners=True,
+            )[0, :, 0, 0]
+            expected = current_center - previous_center
+            terms.append(
+                functional.smooth_l1_loss(
+                    predicted,
+                    expected.to(dtype=predicted.dtype),
+                    beta=huber_delta,
+                    reduction='mean',
+                )
+            )
+            motion_magnitudes.append(float(expected.norm().detach().item()))
+            pair_count += 1
+    if not terms:
+        return velocity_maps.sum() * 0.0, {
+            'pair_count': 0,
+            'mean_motion': 0.0,
+        }
+    return torch.stack(terms).mean(), {
+        'pair_count': pair_count,
+        'mean_motion': sum(motion_magnitudes) / len(motion_magnitudes),
+    }
+
+
 def frame_balanced_event_bce(
     logits,
     labels,
@@ -445,6 +569,34 @@ def frame_balanced_event_bce(
     return torch.stack(per_view_losses).mean(), {
         'positive_fraction': float(labels.mean().detach().item()),
         'mean_positive_weight': float(sum(positive_weights) / len(positive_weights)),
+    }
+
+
+def hard_negative_score_loss(
+    logits,
+    labels,
+    score_floor=0.45,
+):
+    """Penalize only high-confidence background event predictions.
+
+    The ordinary balanced BCE already handles easy background events. This
+    auxiliary term targets false-positive candidates without changing the
+    gradient of background scores below ``score_floor``.
+    """
+    if logits.ndim != 1 or labels.ndim != 1 or logits.shape != labels.shape:
+        raise ValueError('logits and labels must be matching flat tensors.')
+    score_floor = float(score_floor)
+    if not 0.0 <= score_floor < 1.0:
+        raise ValueError('score_floor must be in [0, 1).')
+    negative_mask = labels.float() <= 0.5
+    if not bool(negative_mask.any()):
+        return logits.sum() * 0.0, {'hard_negative_fraction': 0.0}
+    negative_scores = torch.sigmoid(logits[negative_mask])
+    excess = functional.relu(negative_scores - score_floor)
+    return excess.square().mean(), {
+        'hard_negative_fraction': float(
+            (excess > 0.0).float().mean().detach().item()
+        ),
     }
 
 
@@ -769,6 +921,276 @@ def trajectory_extrapolation_loss_p23(
         return logit_maps.sum() * 0.0, stats
 
     return torch.stack(losses).mean(), stats
+
+
+def target_centroid_flow_loss(
+    forward_flows,
+    event_time_indices,
+    event_x,
+    event_y,
+    labels,
+    target_ids,
+    input_width,
+    input_height,
+    huber_delta=1.0,
+    fast_motion_threshold=0.0,
+    fast_motion_weight=1.0,
+):
+    """Supervise advection flow at labelled target centroids.
+
+    ``forward_flows[t]`` moves the recurrent state from time ``t - 1`` to
+    output coordinates at ``t``. The warp therefore samples the previous
+    state at ``current_center + flow`` and must learn ``previous - current``.
+    The loss is evaluated only for targets observed in both adjacent bins.
+    """
+    tensors = (event_time_indices, event_x, event_y, labels, target_ids)
+    if any(tensor.ndim != 1 for tensor in tensors):
+        raise ValueError('Target-flow inputs must be flat tensors.')
+    if not (
+        event_time_indices.shape
+        == event_x.shape
+        == event_y.shape
+        == labels.shape
+        == target_ids.shape
+    ):
+        raise ValueError('Target-flow inputs must have matching shapes.')
+    input_width = int(input_width)
+    input_height = int(input_height)
+    huber_delta = float(huber_delta)
+    fast_motion_threshold = float(fast_motion_threshold)
+    fast_motion_weight = float(fast_motion_weight)
+    if input_width <= 1 or input_height <= 1:
+        raise ValueError('Target-flow input dimensions must exceed one.')
+    if huber_delta <= 0.0:
+        raise ValueError('target-flow huber_delta must be positive.')
+    if fast_motion_threshold < 0.0:
+        raise ValueError('fast_motion_threshold must be non-negative.')
+    if fast_motion_weight < 1.0:
+        raise ValueError('fast_motion_weight must be at least one.')
+
+    reference = next((flow for flow in forward_flows if flow is not None), None)
+    if reference is None:
+        return labels.sum() * 0.0, {
+            'pair_count': 0,
+            'fast_pair_count': 0,
+            'mean_pair_weight': 0.0,
+            'target_motion_mean': 0.0,
+        }
+    if reference.ndim != 4 or reference.shape[0] != 1 or reference.shape[1] != 2:
+        raise ValueError('Target-flow supervision currently requires [1, 2, H, W].')
+
+    valid = (labels > 0.5) & (target_ids.long() > 0)
+    terms = []
+    term_weights = []
+    target_magnitudes = []
+    fast_pair_count = 0
+    for time_index in range(1, len(forward_flows)):
+        flow = forward_flows[time_index]
+        if flow is None:
+            continue
+        previous_mask = valid & (event_time_indices == time_index - 1)
+        current_mask = valid & (event_time_indices == time_index)
+        if not bool(previous_mask.any()) or not bool(current_mask.any()):
+            continue
+        current_ids = target_ids[current_mask].unique(sorted=True)
+        for target_id in current_ids:
+            previous_target = previous_mask & (target_ids == target_id)
+            current_target = current_mask & (target_ids == target_id)
+            if not bool(previous_target.any() and current_target.any()):
+                continue
+            previous_center = torch.stack((
+                event_x[previous_target].float().mean(),
+                event_y[previous_target].float().mean(),
+            ))
+            current_center = torch.stack((
+                event_x[current_target].float().mean(),
+                event_y[current_target].float().mean(),
+            ))
+            flow_height, flow_width = flow.shape[-2:]
+            sample_grid = torch.stack((
+                current_center[0] * (2.0 / (input_width - 1)) - 1.0,
+                current_center[1] * (2.0 / (input_height - 1)) - 1.0,
+            )).reshape(1, 1, 1, 2)
+            predicted = functional.grid_sample(
+                flow,
+                sample_grid.to(dtype=flow.dtype),
+                mode='bilinear',
+                padding_mode='border',
+                align_corners=True,
+            )[0, :, 0, 0]
+            expected = torch.stack((
+                (previous_center[0] - current_center[0])
+                * ((flow_width - 1.0) / (input_width - 1.0)),
+                (previous_center[1] - current_center[1])
+                * ((flow_height - 1.0) / (input_height - 1.0)),
+            )).to(dtype=flow.dtype)
+            error = torch.abs(predicted - expected)
+            pair_loss = torch.where(
+                error < huber_delta,
+                0.5 * error.square() / huber_delta,
+                error - 0.5 * huber_delta,
+            ).mean()
+            input_motion = torch.linalg.vector_norm(
+                previous_center - current_center
+            )
+            is_fast = bool(input_motion.detach().item() >= fast_motion_threshold)
+            pair_weight = fast_motion_weight if is_fast else 1.0
+            terms.append(pair_loss * pair_weight)
+            term_weights.append(pair_weight)
+            fast_pair_count += int(is_fast)
+            target_magnitudes.append(torch.linalg.vector_norm(expected.detach()))
+
+    if not terms:
+        return reference.sum() * 0.0, {
+            'pair_count': 0,
+            'fast_pair_count': 0,
+            'mean_pair_weight': 0.0,
+            'target_motion_mean': 0.0,
+        }
+    return torch.stack(terms).sum() / sum(term_weights), {
+        'pair_count': len(terms),
+        'fast_pair_count': fast_pair_count,
+        'mean_pair_weight': float(sum(term_weights) / len(term_weights)),
+        'target_motion_mean': float(
+            torch.stack(target_magnitudes).mean().detach().item()
+        ),
+    }
+
+
+def target_centroid_trajectory_flow_loss(
+    forward_flows,
+    event_time_indices,
+    event_x,
+    event_y,
+    labels,
+    target_ids,
+    input_width,
+    input_height,
+    huber_delta=1.0,
+    max_hop=2,
+):
+    """Supervise a composed inverse displacement over several time bins.
+
+    A flow at time ``t`` samples the recurrent state at the previous
+    coordinate.  Starting at a labelled target centre in ``t``, repeatedly
+    sampling the predicted flow therefore gives a differentiable estimate of
+    the centre in ``t - max_hop``.  The composed displacement is compared
+    with the annotated centres only when the same target is present in every
+    intervening bin.
+    """
+    tensors = (event_time_indices, event_x, event_y, labels, target_ids)
+    if any(tensor.ndim != 1 for tensor in tensors):
+        raise ValueError('Trajectory-flow inputs must be flat tensors.')
+    if not (
+        event_time_indices.shape
+        == event_x.shape
+        == event_y.shape
+        == labels.shape
+        == target_ids.shape
+    ):
+        raise ValueError('Trajectory-flow inputs must have matching shapes.')
+    input_width = int(input_width)
+    input_height = int(input_height)
+    huber_delta = float(huber_delta)
+    max_hop = int(max_hop)
+    if input_width <= 1 or input_height <= 1:
+        raise ValueError('Trajectory-flow input dimensions must exceed one.')
+    if huber_delta <= 0.0:
+        raise ValueError('trajectory-flow huber_delta must be positive.')
+    if max_hop < 2:
+        raise ValueError('trajectory-flow max_hop must be at least two.')
+
+    reference = next((flow for flow in forward_flows if flow is not None), None)
+    if reference is None:
+        return labels.sum() * 0.0, {
+            'pair_count': 0,
+            'target_motion_mean': 0.0,
+        }
+    if reference.ndim != 4 or reference.shape[0] != 1 or reference.shape[1] != 2:
+        raise ValueError('Trajectory-flow supervision requires [1, 2, H, W].')
+
+    valid = (labels > 0.5) & (target_ids.long() > 0)
+    terms = []
+    target_magnitudes = []
+    for time_index in range(max_hop, len(forward_flows)):
+        current_flow = forward_flows[time_index]
+        if current_flow is None:
+            continue
+        current_mask = valid & (event_time_indices == time_index)
+        if not bool(current_mask.any()):
+            continue
+        current_ids = target_ids[current_mask].unique(sorted=True)
+        for target_id in current_ids:
+            centers = []
+            complete = True
+            for offset in range(max_hop + 1):
+                target_mask = valid & (
+                    event_time_indices == time_index - offset
+                ) & (target_ids == target_id)
+                if not bool(target_mask.any()):
+                    complete = False
+                    break
+                centers.append(torch.stack((
+                    event_x[target_mask].float().mean(),
+                    event_y[target_mask].float().mean(),
+                )))
+            if not complete:
+                continue
+
+            flow_height, flow_width = current_flow.shape[-2:]
+            position = torch.stack((
+                centers[0][0] * ((flow_width - 1.0) / (input_width - 1.0)),
+                centers[0][1] * ((flow_height - 1.0) / (input_height - 1.0)),
+            )).to(dtype=current_flow.dtype)
+            predicted = position.new_zeros(2)
+            valid_flow_chain = True
+            for hop in range(max_hop):
+                flow = forward_flows[time_index - hop]
+                if flow is None:
+                    valid_flow_chain = False
+                    break
+                flow_height, flow_width = flow.shape[-2:]
+                sample_grid = torch.stack((
+                    position[0] * (2.0 / (flow_width - 1.0)) - 1.0,
+                    position[1] * (2.0 / (flow_height - 1.0)) - 1.0,
+                )).reshape(1, 1, 1, 2)
+                step = functional.grid_sample(
+                    flow,
+                    sample_grid,
+                    mode='bilinear',
+                    padding_mode='border',
+                    align_corners=True,
+                )[0, :, 0, 0]
+                predicted = predicted + step
+                position = position + step
+            if not valid_flow_chain:
+                continue
+
+            expected = torch.stack((
+                (centers[-1][0] - centers[0][0])
+                * ((flow_width - 1.0) / (input_width - 1.0)),
+                (centers[-1][1] - centers[0][1])
+                * ((flow_height - 1.0) / (input_height - 1.0)),
+            )).to(dtype=current_flow.dtype)
+            error = torch.abs(predicted - expected)
+            terms.append(torch.where(
+                error < huber_delta,
+                0.5 * error.square() / huber_delta,
+                error - 0.5 * huber_delta,
+            ).mean())
+            target_magnitudes.append(torch.linalg.vector_norm(expected.detach()))
+
+    if not terms:
+        return reference.sum() * 0.0, {
+            'pair_count': 0,
+            'target_motion_mean': 0.0,
+        }
+    return torch.stack(terms).mean(), {
+        'pair_count': len(terms),
+        'target_motion_mean': float(
+            torch.stack(target_magnitudes).mean().detach().item()
+        ),
+    }
 
 
 def trajectory_extrapolation_loss_memory(

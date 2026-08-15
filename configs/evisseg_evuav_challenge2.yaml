@@ -246,6 +246,9 @@ TEMPORAL_MEMORY:
   temporal_memory_positive_frame_probability: 0.75
   temporal_memory_target_positive_loss_mass: 0.20
   temporal_memory_max_positive_weight: 16.0
+  # M61: isolate a low-density expert without changing the high-density path.
+  temporal_memory_low_density_only_enabled: false
+  temporal_memory_low_density_only_event_count_cutoff: 30000
   # Training-only loss terms aligned with Challenge 2 Pd and false components.
   temporal_memory_metric_aux_enabled: false
   temporal_memory_metric_target_weight: 0.01
@@ -262,9 +265,27 @@ TEMPORAL_MEMORY:
   temporal_memory_train_workers: 0
   temporal_memory_inference_batch_size: 8
   temporal_memory_model_path: ""
+  temporal_memory_fine_time_expert_enabled: false
+  temporal_memory_fine_time_expert_model_path: ""
+  temporal_memory_fine_time_expert_event_count_cutoff: 30000
+  temporal_memory_fine_time_expert_weight: 0.25
+  temporal_memory_fine_time_expert_bin_size: 25
+  temporal_memory_fine_time_expert_context_bins: 5
+  temporal_memory_fine_time_expert_sequence_length: 32
+  # M49: P41-aligned phase specialist, off by default.
+  temporal_memory_phase_specialist_enabled: false
+  temporal_memory_phase_specialist_model_path: ""
+  temporal_memory_phase_specialist_event_count_cutoff: 30000
+  temporal_memory_phase_specialist_weight: 0.25
+  temporal_memory_phase_specialist_offset: 25
   temporal_memory_init_model_path: ""
+  temporal_memory_init_allow_sequence_length_transfer: false
+  temporal_memory_init_allow_temporal_bin_transfer: false
+  temporal_memory_training_phase_offset: 0
   temporal_memory_base_lr_multiplier: 0.1
   temporal_memory_memory_lr_multiplier: 1.0
+  # M69: adapt only existing temporal-memory modules to a longer sequence.
+  temporal_memory_memory_only_enabled: false
 
 ENSEMBLE:
   # E1: disabled by default; TEST.model_path remains the primary checkpoint.
@@ -289,6 +310,25 @@ INFERENCE_TTA:
   # P14: label-free horizontal-flip score averaging before P6 and P0.
   p14_horizontal_flip_enabled: false
   p14_horizontal_flip_original_weight: 1.0
+  p41_temporal_phase_enabled: false
+  p41_temporal_phase_offset: 25
+  p41_temporal_phase_original_weight: 1.0
+  p41_temporal_phase_min_event_count: 0
+  p41_temporal_phase_average_mode: probability
+  p41_temporal_phase_boundary_adaptive: false
+  p54_temporal_reverse_enabled: false
+  p54_temporal_reverse_original_weight: 1.0
+  p54_temporal_reverse_min_event_count: 0
+  # P50: evenly distribute P41's alternate-view mass over three time phases.
+  # Disabled by default so the established P41 production path is unchanged.
+  p50_temporal_multiphase_enabled: false
+  p50_temporal_multiphase_offsets: [12, 25, 37]
+  p50_temporal_multiphase_original_weight: 0.75
+  p50_temporal_multiphase_min_event_count: 0
+  # P44: average all one-pixel spatial grid phases before postprocessing.
+  p44_spatial_phase_enabled: false
+  p44_spatial_phase_offset: 1
+  p44_spatial_phase_min_event_count: 0
 
 HORIZONTAL_FLIP_TTA_SWEEP:
   # Used only by sweep_horizontal_flip_tta.py; it does not affect test2.py

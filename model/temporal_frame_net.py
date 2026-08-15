@@ -250,6 +250,7 @@ class TemporalFrameNet(nn.Module):
         local_contrast_channels=0,
         motion_persistence_channels=0,
         fine_detail_channels=0,
+        local_temporal_context_channels=0,
         target_center_enabled=False,
         confidence_head_enabled=False,
         density_calibration_enabled=False,
@@ -260,6 +261,7 @@ class TemporalFrameNet(nn.Module):
         local_contrast_channels = int(local_contrast_channels)
         motion_persistence_channels = int(motion_persistence_channels)
         fine_detail_channels = int(fine_detail_channels)
+        local_temporal_context_channels = int(local_temporal_context_channels)
         if input_channels <= 0 or width <= 0:
             raise ValueError('input_channels and width must be positive.')
         if local_contrast_channels < 0:
@@ -268,11 +270,16 @@ class TemporalFrameNet(nn.Module):
             raise ValueError('motion_persistence_channels must not be negative.')
         if fine_detail_channels < 0:
             raise ValueError('fine_detail_channels must not be negative.')
+        if local_temporal_context_channels < 0:
+            raise ValueError(
+                'local_temporal_context_channels must not be negative.'
+            )
 
         self.input_channels = input_channels
         self.local_contrast_channels = local_contrast_channels
         self.motion_persistence_channels = motion_persistence_channels
         self.fine_detail_channels = fine_detail_channels
+        self.local_temporal_context_channels = local_temporal_context_channels
         self.target_center_enabled = bool(target_center_enabled)
         self.confidence_head_enabled = bool(confidence_head_enabled)
         self.density_calibration_enabled = bool(density_calibration_enabled)
@@ -313,6 +320,17 @@ class TemporalFrameNet(nn.Module):
             )
             nn.init.zeros_(self.fine_detail_adapter.weight)
             nn.init.zeros_(self.fine_detail_adapter.bias)
+        self.local_temporal_context_adapter = None
+        if local_temporal_context_channels:
+            self.local_temporal_context_adapter = nn.Conv2d(
+                local_temporal_context_channels,
+                width,
+                kernel_size=3,
+                padding=1,
+                bias=True,
+            )
+            nn.init.zeros_(self.local_temporal_context_adapter.weight)
+            nn.init.zeros_(self.local_temporal_context_adapter.bias)
         self.encoder1 = DownBlock(width, width2)
         self.encoder2 = DownBlock(width2, width4)
         self.encoder3 = DownBlock(width4, width6)
@@ -356,52 +374,75 @@ class TemporalFrameNet(nn.Module):
                 reduction=16,
             )
 
+    @property
+    def total_input_channels(self):
+        """Number of raw and optional adapter input channels."""
+        return (
+            self.input_channels
+            + self.local_contrast_channels
+            + self.motion_persistence_channels
+            + self.fine_detail_channels
+            + self.local_temporal_context_channels
+        )
+
+    def encode_features(self, inputs):
+        """Return encoder features shared by frame and memory inference.
+
+        The local temporal-context adapter is zero-initialized.  Unlike older
+        input adapters, it must not introduce a new activation at attachment
+        time, otherwise a zero adapter would still perturb released logits.
+        """
+        if inputs.ndim != 4:
+            raise ValueError('inputs must have shape [B, C, H, W].')
+        if inputs.shape[1] != self.total_input_channels:
+            raise ValueError(
+                'inputs have {} channels, expected {}.'.format(
+                    inputs.shape[1], self.total_input_channels
+                )
+            )
+        level0 = self.encoder0(inputs[:, :self.input_channels])
+        adapter_offset = self.input_channels
+        legacy_adapter_enabled = False
+        if self.local_contrast_adapter is not None:
+            contrast_end = adapter_offset + self.local_contrast_channels
+            level0 = level0 + self.local_contrast_adapter(
+                inputs[:, adapter_offset:contrast_end]
+            )
+            adapter_offset = contrast_end
+            legacy_adapter_enabled = True
+        if self.motion_persistence_adapter is not None:
+            motion_end = adapter_offset + self.motion_persistence_channels
+            level0 = level0 + self.motion_persistence_adapter(
+                inputs[:, adapter_offset:motion_end]
+            )
+            adapter_offset = motion_end
+            legacy_adapter_enabled = True
+        if self.fine_detail_adapter is not None:
+            fine_detail_end = adapter_offset + self.fine_detail_channels
+            level0 = level0 + self.fine_detail_adapter(
+                inputs[:, adapter_offset:fine_detail_end]
+            )
+            adapter_offset = fine_detail_end
+            legacy_adapter_enabled = True
+        if self.local_temporal_context_adapter is not None:
+            context_end = adapter_offset + self.local_temporal_context_channels
+            level0 = level0 + self.local_temporal_context_adapter(
+                inputs[:, adapter_offset:context_end]
+            )
+        if legacy_adapter_enabled:
+            level0 = functional.relu(level0, inplace=False)
+        level1 = self.encoder1(level0)
+        level2 = self.encoder2(level1)
+        level3 = self.context(self.encoder3(level2))
+        return level0, level1, level2, level3
+
     def forward(
         self,
         inputs,
         return_target_center_logits=False,
         return_confidence_logits=False,
     ):
-        if inputs.ndim != 4:
-            raise ValueError('inputs must have shape [B, C, H, W].')
-        expected_channels = (
-            self.input_channels
-            + self.local_contrast_channels
-            + self.motion_persistence_channels
-            + self.fine_detail_channels
-        )
-        if inputs.shape[1] != expected_channels:
-            raise ValueError(
-                'inputs have {} channels, expected {}.'.format(
-                    inputs.shape[1],
-                    expected_channels,
-                )
-            )
-        level0 = self.encoder0(inputs[:, :self.input_channels])
-        adapter_offset = self.input_channels
-        if self.local_contrast_adapter is not None:
-            contrast_end = adapter_offset + self.local_contrast_channels
-            contrast_inputs = inputs[:, adapter_offset:contrast_end]
-            level0 = level0 + self.local_contrast_adapter(contrast_inputs)
-            adapter_offset = contrast_end
-        if self.motion_persistence_adapter is not None:
-            motion_end = adapter_offset + self.motion_persistence_channels
-            motion_inputs = inputs[:, adapter_offset:motion_end]
-            level0 = level0 + self.motion_persistence_adapter(motion_inputs)
-            adapter_offset = motion_end
-        if self.fine_detail_adapter is not None:
-            fine_detail_end = adapter_offset + self.fine_detail_channels
-            fine_detail_inputs = inputs[:, adapter_offset:fine_detail_end]
-            level0 = level0 + self.fine_detail_adapter(fine_detail_inputs)
-        if (
-            self.local_contrast_adapter is not None
-            or self.motion_persistence_adapter is not None
-            or self.fine_detail_adapter is not None
-        ):
-            level0 = functional.relu(level0, inplace=False)
-        level1 = self.encoder1(level0)
-        level2 = self.encoder2(level1)
-        level3 = self.context(self.encoder3(level2))
+        level0, level1, level2, level3 = self.encode_features(inputs)
         decoded2 = self.decoder2(level3, level2)
         decoded1 = self.decoder1(decoded2, level1)
         decoded0 = self.decoder0(decoded1, level0)

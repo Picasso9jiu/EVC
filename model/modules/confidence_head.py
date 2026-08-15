@@ -9,11 +9,11 @@ import torch.nn.functional as F
 
 
 class ConfidenceHead(nn.Module):
-    """Confidence prediction head for estimating prediction reliability.
+    """Zero-initialized residual logit calibrator.
 
-    Identity-biased initialization keeps a newly added branch close to a
-    no-op: sigmoid(4) is about 0.982, so multiplying it into the event score
-    does not invalidate an already trained segmentation model.
+    Its output is added to the released segmentation logit. The final layer
+    starts at exactly zero, so attaching it preserves every prediction before
+    the first optimizer step.
     """
 
     def __init__(self, width):
@@ -26,14 +26,14 @@ class ConfidenceHead(nn.Module):
         )
 
         nn.init.zeros_(self.layers[-1].weight)
-        nn.init.constant_(self.layers[-1].bias, 4.0)
+        nn.init.zeros_(self.layers[-1].bias)
 
     def forward(self, decoder_features):
         """Args:
             decoder_features: Decoder output features [B, C, H, W]
 
         Returns:
-            torch.Tensor: Confidence logit [B, 1, H, W]
+            torch.Tensor: Additive event-logit residual [B, 1, H, W]
         """
         return self.layers(decoder_features)
 
@@ -44,20 +44,15 @@ def confidence_calibration_loss(
     labels_soft,
     hard_target=True,
 ):
-    """Confidence calibration loss.
+    """Train a residual confidence calibrator without moving the base model.
 
-    With hard_target=True (default) the head predicts binary correctness:
-    confidence approaches 1 at positive events and 0 at negative events,
-    using a class-balanced BCE.  At inference the score is recalibrated as
-    ``prob * sigmoid(conf)``, so keeping confidence near 1 for true positives
-    (rather than tying it to the probability) avoids squashing predictions.
-
-    With hard_target=False it predicts the softer reliability
-    ``1 - |predicted_prob - true_label|`` via MSE.
+    The production path adds this residual to the detached base logit and
+    optimizes class-balanced BCE. It can lower background scores without a
+    global threshold shift and begins as an exact identity mapping.
 
     Args:
-        confidence_logits: Confidence prediction logits [E]
-        event_logits: Event prediction logits [E]
+        confidence_logits: Additive calibration logits [E]
+        event_logits: Frozen base event logits [E]
         labels_soft: Ground truth labels [E]
         hard_target: Whether to supervise hard correctness instead of soft
             reliability.
@@ -66,6 +61,7 @@ def confidence_calibration_loss(
         torch.Tensor: Calibration loss value
     """
     if hard_target:
+        calibrated_logits = event_logits.detach() + confidence_logits
         positive = labels_soft > 0.5
         positive_count = positive.sum().clamp(min=1).float()
         negative_count = (~positive).sum().clamp(min=1).float()
@@ -79,7 +75,7 @@ def confidence_calibration_loss(
             0.5 * total / negative_count,
         )
         return F.binary_cross_entropy_with_logits(
-            confidence_logits,
+            calibrated_logits,
             labels_soft,
             weight=weight,
         )
