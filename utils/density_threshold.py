@@ -24,6 +24,14 @@ class DensityAdaptiveThresholdConfig:
     event_count_cutoff: int = 100000
     low_density_threshold: float = 0.70
     high_density_threshold: float = 0.92
+    # Optional M169 audit policy.  It is disabled by default and preserves
+    # the original two-density behavior unless explicitly enabled.
+    polarity_domain_enabled: bool = False
+    middle_event_count_cutoff: int = 200000
+    middle_density_threshold: float = 0.728
+    high_polarity_minority_cutoff: float = 0.20
+    high_imbalanced_threshold: float = 0.722
+    high_balanced_threshold: float = 0.724
 
     def __post_init__(self):
         select_density_threshold(
@@ -44,6 +52,24 @@ class DensityAdaptiveThresholdConfig:
             high_density_threshold=float(
                 getattr(cfg, 'p6_high_density_threshold', 0.92)
             ),
+            polarity_domain_enabled=_as_bool(
+                getattr(cfg, 'p6_polarity_domain_enabled', False)
+            ),
+            middle_event_count_cutoff=int(
+                getattr(cfg, 'p6_middle_event_count_cutoff', 200000)
+            ),
+            middle_density_threshold=float(
+                getattr(cfg, 'p6_middle_density_threshold', 0.728)
+            ),
+            high_polarity_minority_cutoff=float(
+                getattr(cfg, 'p6_high_polarity_minority_cutoff', 0.20)
+            ),
+            high_imbalanced_threshold=float(
+                getattr(cfg, 'p6_high_imbalanced_threshold', 0.722)
+            ),
+            high_balanced_threshold=float(
+                getattr(cfg, 'p6_high_balanced_threshold', 0.724)
+            ),
         )
 
     def threshold_for_event_count(self, event_count, fallback_threshold):
@@ -57,9 +83,52 @@ class DensityAdaptiveThresholdConfig:
             self.high_density_threshold,
         )
 
+    def threshold_for_sample(self, event_count, event_features, fallback_threshold):
+        """Return a density/polarity-domain threshold for one full video.
+
+        The polarity branch uses only the observed event stream.  The
+        dataset exposes polarity as column 3 of ``evs_norm`` (``[x, y, t, p]``);
+        ``ev_loc`` intentionally contains only ``[x, y, t]`` and must not be
+        passed here.  Invalid or empty polarity data falls back to the
+        ordinary event-count policy.
+        """
+        if not self.enabled or not self.polarity_domain_enabled:
+            return self.threshold_for_event_count(event_count, fallback_threshold)
+        count = int(event_count)
+        if count <= int(self.event_count_cutoff):
+            return float(self.low_density_threshold)
+        if count <= int(self.middle_event_count_cutoff):
+            return float(self.middle_density_threshold)
+        try:
+            if hasattr(event_features, 'detach'):
+                polarity = event_features.detach().cpu().numpy()[:, 3]
+            else:
+                polarity = __import__('numpy').asarray(event_features)[:, 3]
+            if polarity.size == 0:
+                raise ValueError('empty polarity')
+            positive = float((polarity > 0.5).mean())
+            minority = min(positive, 1.0 - positive)
+        except (IndexError, TypeError, ValueError):
+            return self.threshold_for_event_count(event_count, fallback_threshold)
+        if minority < float(self.high_polarity_minority_cutoff):
+            return float(self.high_imbalanced_threshold)
+        return float(self.high_balanced_threshold)
+
     def describe(self, fallback_threshold):
         if not self.enabled:
             return 'static ({:.3f})'.format(float(fallback_threshold))
+        if self.polarity_domain_enabled:
+            return (
+                'density/polarity-domain (<= {} -> {:.3f}, <= {} -> {:.3f}, '
+                'high imbalanced/balanced -> {:.3f}/{:.3f})'
+            ).format(
+                self.event_count_cutoff,
+                self.low_density_threshold,
+                self.middle_event_count_cutoff,
+                self.middle_density_threshold,
+                self.high_imbalanced_threshold,
+                self.high_balanced_threshold,
+            )
         return (
             'density-adaptive (event_count > {} -> {:.3f}, otherwise {:.3f})'
         ).format(

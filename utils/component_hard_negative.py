@@ -9,6 +9,228 @@ def _zero_loss(predictions):
     return predictions.reshape(-1).sum() * 0
 
 
+def _group_max(values, inverse, group_count):
+    """Compute differentiable per-group maxima on the repository's torch version."""
+    if group_count <= 0 or values.numel() == 0:
+        return values.new_empty((0,))
+    order = torch.argsort(inverse)
+    sorted_inverse = inverse[order]
+    sorted_values = values[order]
+    starts = torch.cat(
+        (
+            inverse.new_zeros(1),
+            torch.nonzero(
+                sorted_inverse[1:] != sorted_inverse[:-1],
+                as_tuple=False,
+            ).reshape(-1) + 1,
+        )
+    )
+    ends = torch.cat((starts[1:], starts.new_tensor([sorted_values.numel()])))
+    peaks = [
+        sorted_values[int(start):int(end)].max()
+        for start, end in zip(starts.tolist(), ends.tolist())
+    ]
+    if len(peaks) != int(group_count):
+        raise RuntimeError(
+            'Grouped maxima produced {} groups; expected {}.'.format(
+                len(peaks), group_count
+            )
+        )
+    return torch.stack(peaks)
+
+
+def _group_sum(values, inverse, group_count):
+    """Compute per-group sums without CUDA atomic scatter operations."""
+    if group_count <= 0 or values.numel() == 0:
+        return values.new_empty((0,))
+    order = torch.argsort(inverse)
+    sorted_inverse = inverse[order]
+    sorted_values = values[order]
+    _, counts = torch.unique_consecutive(sorted_inverse, return_counts=True)
+    if int(counts.numel()) != int(group_count):
+        raise RuntimeError(
+            'Grouped sums produced {} groups; expected {}.'.format(
+                counts.numel(), group_count
+            )
+        )
+    ends = torch.cumsum(counts, dim=0)
+    starts = ends - counts
+    prefix = torch.cat((sorted_values.new_zeros(1), torch.cumsum(sorted_values, dim=0)))
+    return prefix.index_select(0, ends) - prefix.index_select(0, starts)
+
+
+def teacher_selective_metric_loss(
+    student_logits,
+    teacher_logits,
+    labels,
+    target_ids,
+    locations,
+    temporal_bin_size,
+    decision_threshold,
+    spatial_cell_size,
+    min_cell_events,
+    component_ratio,
+):
+    """Apply the fixed M134 teacher-selective target and background losses.
+
+    The teacher selects target windows and hard background cells.  It is detached
+    here so only the student contributes gradients; grouped maxima match the
+    official "at least one event in a target window" decision rule.
+    """
+    student_logits = student_logits.reshape(-1)
+    teacher_logits = teacher_logits.reshape(-1).detach()
+    labels = labels.reshape(-1)
+    target_ids = target_ids.reshape(-1).long()
+    if locations.ndim != 2 or locations.shape[1] < 4:
+        raise ValueError('locations must have shape [N, >=4].')
+    if not (
+        student_logits.numel()
+        == teacher_logits.numel()
+        == labels.numel()
+        == target_ids.numel()
+        == locations.shape[0]
+    ):
+        raise ValueError(
+            'student, teacher, label, target-id, and location counts must match.'
+        )
+    if temporal_bin_size <= 0:
+        raise ValueError('temporal_bin_size must be positive.')
+    if not 0.0 < float(decision_threshold) < 1.0:
+        raise ValueError('decision_threshold must be in (0, 1).')
+    if spatial_cell_size <= 0 or min_cell_events <= 0:
+        raise ValueError('Background cell geometry must be positive.')
+    if not 0.0 < float(component_ratio) <= 1.0:
+        raise ValueError('component_ratio must be in (0, 1].')
+
+    threshold_logit = math.log(
+        float(decision_threshold) / (1.0 - float(decision_threshold))
+    )
+    zero = _zero_loss(student_logits)
+    stats = {
+        'target_group_count': 0,
+        'missed_group_count': 0,
+        'covered_group_count': 0,
+        'candidate_cell_count': 0,
+        'hard_bg_count': 0,
+    }
+
+    event_times = locations[:, 3].long()
+    batch_ids = locations[:, 0].long()
+    positive_mask = (labels > 0.5) & (target_ids > 0)
+    recall_loss = zero
+    preserve_loss = zero
+    if torch.any(positive_mask):
+        positive_target_ids = target_ids[positive_mask]
+        positive_times = event_times[positive_mask]
+        positive_batches = batch_ids[positive_mask]
+        time_bins = torch.div(
+            positive_times,
+            int(temporal_bin_size),
+            rounding_mode='floor',
+        )
+        target_stride = int(positive_target_ids.max().item()) + 1
+        time_stride = int(time_bins.max().item()) + 1
+        group_keys = (
+            (positive_batches * target_stride + positive_target_ids)
+            * time_stride
+            + time_bins
+        )
+        _, inverse = torch.unique(group_keys, sorted=True, return_inverse=True)
+        group_count = int(inverse.max().item()) + 1
+        teacher_peaks = _group_max(
+            teacher_logits[positive_mask], inverse, group_count
+        )
+        student_peaks = _group_max(
+            student_logits[positive_mask], inverse, group_count
+        )
+        missed = teacher_peaks < float(threshold_logit)
+        covered = ~missed
+        if torch.any(missed):
+            recall_loss = torch.relu(
+                float(threshold_logit) - student_peaks[missed]
+            ).pow(2).mean()
+        if torch.any(covered):
+            preserve_loss = torch.relu(
+                teacher_peaks[covered] - student_peaks[covered]
+            ).pow(2).mean()
+        stats.update(
+            {
+                'target_group_count': group_count,
+                'missed_group_count': int(missed.sum().item()),
+                'covered_group_count': int(covered.sum().item()),
+            }
+        )
+
+    # Select hard background cells using only detached teacher peaks and labels.
+    background_loss = zero
+    if student_logits.numel() > 0:
+        coordinates = locations.long()
+        cell_x = torch.div(
+            coordinates[:, 1], int(spatial_cell_size), rounding_mode='floor'
+        )
+        cell_y = torch.div(
+            coordinates[:, 2], int(spatial_cell_size), rounding_mode='floor'
+        )
+        cell_time = torch.div(
+            coordinates[:, 3], int(temporal_bin_size), rounding_mode='floor'
+        )
+        x_stride = int(cell_x.max().item()) + 1
+        y_stride = int(cell_y.max().item()) + 1
+        time_stride = int(cell_time.max().item()) + 1
+        cell_keys = (
+            ((batch_ids * time_stride + cell_time) * y_stride + cell_y)
+            * x_stride
+            + cell_x
+        )
+        _, cell_inverse = torch.unique(
+            cell_keys, sorted=True, return_inverse=True
+        )
+        cell_count = int(cell_inverse.max().item()) + 1
+        event_counts = _group_sum(
+            torch.ones_like(student_logits), cell_inverse, cell_count
+        )
+        positive_counts = _group_sum(
+            (labels > 0.5).to(dtype=student_logits.dtype),
+            cell_inverse,
+            cell_count,
+        )
+        candidate_mask = (positive_counts == 0) & (
+            event_counts >= int(min_cell_events)
+        )
+        candidate_indices = torch.nonzero(
+            candidate_mask, as_tuple=False
+        ).reshape(-1)
+        candidate_count = int(candidate_indices.numel())
+        stats['candidate_cell_count'] = candidate_count
+        if candidate_count > 0:
+            hard_count = max(
+                1, int(math.ceil(candidate_count * float(component_ratio)))
+            )
+            teacher_cell_peaks = _group_max(
+                teacher_logits, cell_inverse, cell_count
+            ).detach()
+            student_cell_peaks = _group_max(
+                student_logits, cell_inverse, cell_count
+            )
+            top = torch.topk(
+                teacher_cell_peaks[candidate_indices],
+                k=min(hard_count, candidate_count),
+                largest=True,
+                sorted=False,
+            ).indices
+            hard_indices = candidate_indices[top]
+            background_loss = torch.relu(
+                student_cell_peaks[hard_indices] - float(threshold_logit)
+            ).pow(2).mean()
+            stats['hard_bg_count'] = int(hard_indices.numel())
+
+    return recall_loss + preserve_loss, background_loss, {
+        'recall_loss': recall_loss,
+        'preserve_loss': preserve_loss,
+        **stats,
+    }
+
+
 def _noisy_or(event_activation, inverse, group_count, eps):
     """Aggregate event activations into differentiable group activations."""
     log_not_activation = torch.log1p(

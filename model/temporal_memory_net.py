@@ -1,10 +1,22 @@
 """Bidirectional temporal memory on top of the P23 full-frame backbone."""
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from model.temporal_frame_net import TemporalFrameNet, _group_count
+
+
+def _interpolate(input_tensor, **kwargs):
+    """Use deterministic CPU interpolation for strict paired runs."""
+    if (
+        input_tensor.is_cuda
+        and os.environ.get('EVSOD_DETERMINISTIC_WARP_CPU', '').strip() == '1'
+    ):
+        return F.interpolate(input_tensor.cpu(), **kwargs).to(input_tensor.device)
+    return F.interpolate(input_tensor, **kwargs)
 
 
 class TemporalSelfAttentionMemory(nn.Module):
@@ -104,7 +116,7 @@ class TemporalSelfAttentionMemory(nn.Module):
 
         if (h, w) != (H, W):
             flat_r = residual.reshape(B * T, C, h, w)
-            flat_r = F.interpolate(
+            flat_r = _interpolate(
                 flat_r, size=(H, W), mode='bilinear', align_corners=False,
             )
             residual = flat_r.reshape(B, T, C, H, W)
@@ -142,13 +154,29 @@ def advect_warp(features, flow, exact_identity=False):
         ),
         dim=-1,
     )
-    warped = F.grid_sample(
-        features,
-        base_grid + displacement,
-        mode='bilinear',
-        padding_mode='border',
-        align_corners=True,
-    )
+    if (
+        features.is_cuda
+        and os.environ.get('EVSOD_DETERMINISTIC_WARP_CPU', '').strip() == '1'
+    ):
+        # PyTorch 1.9 has no deterministic CUDA grid-sampler backward.  The
+        # M134 pair audit opts into this CPU fallback at the bottleneck scale;
+        # device copies preserve autograd while retaining the exact bilinear
+        # warp semantics used by the normal path.
+        warped = F.grid_sample(
+            features.cpu(),
+            (base_grid + displacement).cpu(),
+            mode='bilinear',
+            padding_mode='border',
+            align_corners=True,
+        ).to(features.device)
+    else:
+        warped = F.grid_sample(
+            features,
+            base_grid + displacement,
+            mode='bilinear',
+            padding_mode='border',
+            align_corners=True,
+        )
     if exact_identity:
         # grid_sample at an identity grid has tiny interpolation roundoff in
         # PyTorch 1.9. Keep the exact forward value while retaining the warp
@@ -177,17 +205,32 @@ def advection_consistency_loss(
 class FlowEstimationHead(nn.Module):
     """Estimate bottleneck-space displacement between adjacent time bins."""
 
-    def __init__(self, channels, hidden_channels=None, max_displacement=0.0):
+    def __init__(
+        self,
+        channels,
+        hidden_channels=None,
+        max_displacement=0.0,
+        normalization_max_groups=8,
+    ):
         super().__init__()
         channels = int(channels)
         hidden = int(hidden_channels) if hidden_channels else max(channels // 4, 8)
         max_displacement = float(max_displacement)
+        normalization_max_groups = int(normalization_max_groups)
         if max_displacement < 0.0:
             raise ValueError('max_displacement must be non-negative.')
+        if normalization_max_groups <= 0:
+            raise ValueError('normalization_max_groups must be positive.')
         self.max_displacement = max_displacement
         self.first = nn.Sequential(
             nn.Conv2d(channels * 2, hidden, 3, padding=1, bias=False),
-            nn.GroupNorm(_group_count(hidden), hidden),
+            nn.GroupNorm(
+                _group_count(
+                    hidden,
+                    maximum_groups=normalization_max_groups,
+                ),
+                hidden,
+            ),
             nn.ReLU(inplace=True),
         )
         self.second = nn.Sequential(
@@ -260,7 +303,9 @@ class BidirectionalTemporalMemoryNet(nn.Module):
         self,
         input_channels,
         width=16,
+        normalization_max_groups=8,
         temporal_attention_enabled=False,
+        temporal_attention_num_heads=4,
         temporal_attention_output_init_std=0.0,
         temporal_attention_relative_bias_enabled=False,
         temporal_attention_relative_bias_max_distance=8,
@@ -275,6 +320,9 @@ class BidirectionalTemporalMemoryNet(nn.Module):
         target_center_enabled=False,
         target_level_enabled=False,
         target_level_downsample=4,
+        objectness_gate_enabled=False,
+        objectness_gate_strength=0.5,
+        objectness_gate_downsample=4,
         center_memory_enabled=False,
         center_memory_channels=4,
         center_memory_downsample=4,
@@ -285,8 +333,30 @@ class BidirectionalTemporalMemoryNet(nn.Module):
                 'Target-centre memory and confidence calibration cannot be '
                 'enabled together.'
             )
+        if bool(objectness_gate_enabled) and (
+            bool(confidence_head_enabled)
+            or bool(target_center_enabled)
+            or bool(target_level_enabled)
+        ):
+            raise ValueError(
+                'Objectness gating is mutually exclusive with the existing '
+                'auxiliary output branches.'
+            )
         if bool(center_memory_enabled) and not bool(target_center_enabled):
             raise ValueError('Center memory requires the target-centre head.')
+        normalization_max_groups = int(normalization_max_groups)
+        temporal_attention_num_heads = int(temporal_attention_num_heads)
+        if normalization_max_groups <= 0:
+            raise ValueError('normalization_max_groups must be positive.')
+        if temporal_attention_num_heads <= 0:
+            raise ValueError('temporal_attention_num_heads must be positive.')
+        bottleneck_channels = int(width) * 6
+        if bottleneck_channels % temporal_attention_num_heads != 0:
+            raise ValueError(
+                'Temporal attention channels must divide evenly into its heads.'
+            )
+        self.normalization_max_groups = normalization_max_groups
+        self.temporal_attention_num_heads = temporal_attention_num_heads
         self.base = TemporalFrameNet(
             input_channels=int(input_channels),
             width=int(width),
@@ -296,6 +366,7 @@ class BidirectionalTemporalMemoryNet(nn.Module):
             density_calibration_enabled=bool(density_calibration_enabled),
             confidence_head_enabled=bool(confidence_head_enabled),
             target_center_enabled=bool(target_center_enabled),
+            normalization_max_groups=normalization_max_groups,
         )
         self.local_temporal_context_enabled = bool(local_temporal_context_enabled)
         self.local_temporal_context_kernel_size = int(
@@ -309,6 +380,46 @@ class BidirectionalTemporalMemoryNet(nn.Module):
                 'local_temporal_context_kernel_size must be a positive odd integer.'
             )
         self.confidence_head_enabled = bool(confidence_head_enabled)
+        self.objectness_gate_enabled = bool(objectness_gate_enabled)
+        self.objectness_gate_strength = float(objectness_gate_strength)
+        self.objectness_gate_downsample = int(objectness_gate_downsample)
+        if self.objectness_gate_enabled:
+            if self.objectness_gate_strength <= 0.0:
+                raise ValueError('Objectness gate strength must be positive.')
+            if self.objectness_gate_downsample <= 0:
+                raise ValueError('Objectness gate downsample must be positive.')
+        self.objectness_center_head = None
+        self.objectness_presence_head = None
+        self.objectness_velocity_head = None
+        self.objectness_event_gate = None
+        if self.objectness_gate_enabled:
+            hidden_width = max(4, int(width) // 2)
+            self.objectness_center_head = nn.Sequential(
+                nn.Conv2d(int(width), int(width), kernel_size=3, padding=1),
+                nn.ReLU(inplace=False),
+                nn.Conv2d(int(width), 1, kernel_size=1),
+            )
+            self.objectness_presence_head = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Linear(int(width), hidden_width),
+                nn.ReLU(inplace=False),
+                nn.Linear(hidden_width, 1),
+            )
+            self.objectness_velocity_head = nn.Sequential(
+                nn.Conv2d(int(width), int(width), kernel_size=3, padding=1),
+                nn.ReLU(inplace=False),
+                nn.Conv2d(int(width), 2, kernel_size=1),
+            )
+            self.objectness_event_gate = nn.Sequential(
+                nn.Conv2d(int(width) + 1, int(width), kernel_size=3, padding=1),
+                nn.ReLU(inplace=False),
+                nn.Conv2d(int(width), 1, kernel_size=1),
+            )
+            # Keep the released M26 logits unchanged until this branch learns
+            # a residual, while its supervised objectness heads remain active.
+            nn.init.zeros_(self.objectness_event_gate[-1].weight)
+            nn.init.zeros_(self.objectness_event_gate[-1].bias)
         # M91 is an auxiliary target-level task.  It never feeds the event
         # head, so attaching it to an M26 checkpoint preserves the released
         # event predictions before training while still shaping shared
@@ -339,7 +450,6 @@ class BidirectionalTemporalMemoryNet(nn.Module):
                 nn.ReLU(inplace=False),
                 nn.Conv2d(int(width), 2, kernel_size=1),
             )
-        bottleneck_channels = int(width) * 6
         self.forward_memory = ConvGRUCell(bottleneck_channels)
         self.backward_memory = ConvGRUCell(bottleneck_channels)
         self.memory_projection = nn.Conv2d(
@@ -356,7 +466,7 @@ class BidirectionalTemporalMemoryNet(nn.Module):
         if self.temporal_attention_enabled:
             self.temporal_attn = TemporalSelfAttentionMemory(
                 channels=bottleneck_channels,
-                num_heads=4,
+                num_heads=temporal_attention_num_heads,
                 pool_size=16,
                 output_init_std=temporal_attention_output_init_std,
                 relative_bias_enabled=temporal_attention_relative_bias_enabled,
@@ -370,6 +480,7 @@ class BidirectionalTemporalMemoryNet(nn.Module):
             self.flow_head = FlowEstimationHead(
                 bottleneck_channels,
                 max_displacement=self.advection_max_flow,
+                normalization_max_groups=normalization_max_groups,
             )
         self._last_advection_consistency_loss = None
         self._last_advection_forward_flows = None
@@ -400,6 +511,7 @@ class BidirectionalTemporalMemoryNet(nn.Module):
             self.fine_flow_head = FlowEstimationHead(
                 fine_channels,
                 max_displacement=self.fine_advection_max_flow,
+                normalization_max_groups=normalization_max_groups,
             )
         self._last_fine_advection_forward_flows = None
 
@@ -719,7 +831,7 @@ class BidirectionalTemporalMemoryNet(nn.Module):
                 memory_features.shape[4],
             )
         )
-        full_residual = F.interpolate(
+        full_residual = _interpolate(
             flat_residual,
             size=(height, width),
             mode='bilinear',
@@ -739,6 +851,32 @@ class BidirectionalTemporalMemoryNet(nn.Module):
             return self._center_memory_residual(center_logits.unsqueeze(0)).squeeze(0)
         return self._center_memory_residual(center_logits)
 
+    def _objectness_outputs(self, decoded0):
+        if not self.objectness_gate_enabled:
+            raise ValueError('Objectness gating is disabled.')
+        objectness_features = decoded0
+        if self.objectness_gate_downsample > 1:
+            objectness_features = F.avg_pool2d(
+                objectness_features,
+                kernel_size=self.objectness_gate_downsample,
+                stride=self.objectness_gate_downsample,
+                ceil_mode=False,
+            )
+        center_logits = self.objectness_center_head(objectness_features)
+        presence_logits = self.objectness_presence_head(objectness_features).squeeze(-1)
+        velocity = self.objectness_velocity_head(objectness_features)
+        center_probability = _interpolate(
+            torch.sigmoid(center_logits),
+            size=decoded0.shape[-2:],
+            mode='bilinear',
+            align_corners=False,
+        )
+        gated_features = torch.cat((decoded0, center_probability), dim=1)
+        event_delta = self.objectness_gate_strength * torch.tanh(
+            self.objectness_event_gate(gated_features)
+        )
+        return event_delta, center_logits, presence_logits, velocity
+
     def _decode(
         self,
         level0,
@@ -749,6 +887,7 @@ class BidirectionalTemporalMemoryNet(nn.Module):
         return_confidence_logits=False,
         return_target_center_logits=False,
         return_target_level_outputs=False,
+        return_objectness_outputs=False,
         center_memory_residual=None,
     ):
         decoded2 = self.base.decoder2(bottleneck, level2)
@@ -761,6 +900,10 @@ class BidirectionalTemporalMemoryNet(nn.Module):
                 )
             decoded0 = self.base.density_calibrator(decoded0, base_input)
         logits = self.base.head(decoded0)
+        objectness_outputs = None
+        if self.objectness_gate_enabled:
+            objectness_outputs = self._objectness_outputs(decoded0)
+            logits = logits + objectness_outputs[0]
         target_level_outputs = None
         if self.target_level_enabled and return_target_level_outputs:
             target_level_features = decoded0
@@ -803,6 +946,13 @@ class BidirectionalTemporalMemoryNet(nn.Module):
                     'the target-level branch.'
                 )
             return (logits,) + target_level_outputs
+        if return_objectness_outputs:
+            if not self.objectness_gate_enabled:
+                raise ValueError(
+                    'Objectness outputs were requested from a model without '
+                    'the objectness gate.'
+                )
+            return (logits,) + objectness_outputs[1:]
         if return_target_center_logits:
             return logits, target_center_logits
         if return_confidence_logits:
@@ -817,6 +967,7 @@ class BidirectionalTemporalMemoryNet(nn.Module):
         return_confidence_logits=False,
         return_target_center_logits=False,
         return_target_level_outputs=False,
+        return_objectness_outputs=False,
         center_memory_residual=None,
     ):
         """Decode a frame batch after a full-stream memory pass."""
@@ -836,6 +987,7 @@ class BidirectionalTemporalMemoryNet(nn.Module):
             return_confidence_logits=return_confidence_logits,
             return_target_center_logits=return_target_center_logits,
             return_target_level_outputs=return_target_level_outputs,
+            return_objectness_outputs=return_objectness_outputs,
             center_memory_residual=center_memory_residual,
         )
 
@@ -874,6 +1026,7 @@ class BidirectionalTemporalMemoryNet(nn.Module):
         frames,
         return_target_center_logits=False,
         return_target_level_outputs=False,
+        return_objectness_outputs=False,
     ):
         """Predict logit maps for ``[B, T, C, H, W]`` temporal sequences."""
         if frames.ndim != 5:
@@ -929,7 +1082,29 @@ class BidirectionalTemporalMemoryNet(nn.Module):
             return_confidence_logits=self.confidence_head_enabled,
             return_target_center_logits=self.base.target_center_enabled,
             return_target_level_outputs=return_target_level_outputs,
+            return_objectness_outputs=return_objectness_outputs,
         )
+        if self.objectness_gate_enabled and return_objectness_outputs:
+            (
+                logits,
+                objectness_center_logits,
+                objectness_presence_logits,
+                objectness_velocity,
+            ) = decode_output
+            return (
+                logits.reshape(batch_size, sequence_length, *logits.shape[1:]),
+                objectness_center_logits.reshape(
+                    batch_size,
+                    sequence_length,
+                    *objectness_center_logits.shape[1:],
+                ),
+                objectness_presence_logits.reshape(batch_size, sequence_length),
+                objectness_velocity.reshape(
+                    batch_size,
+                    sequence_length,
+                    *objectness_velocity.shape[1:],
+                ),
+            )
         if self.target_level_enabled and return_target_level_outputs:
             (
                 logits,

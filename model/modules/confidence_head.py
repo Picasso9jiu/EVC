@@ -16,11 +16,23 @@ class ConfidenceHead(nn.Module):
     the first optimizer step.
     """
 
-    def __init__(self, width):
+    def __init__(self, width, normalization_max_groups=8):
         super().__init__()
+        normalization_max_groups = int(normalization_max_groups)
+        if normalization_max_groups <= 0:
+            raise ValueError('normalization_max_groups must be positive.')
+        group_count = next(
+            group_count
+            for group_count in range(
+                min(normalization_max_groups, int(width)),
+                0,
+                -1,
+            )
+            if int(width) % group_count == 0
+        )
         self.layers = nn.Sequential(
             nn.Conv2d(width, width, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(8, width),
+            nn.GroupNorm(group_count, width),
             nn.ReLU(inplace=True),
             nn.Conv2d(width, 1, kernel_size=1),
         )

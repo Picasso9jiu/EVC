@@ -6,7 +6,9 @@
 
 ## 当前状态
 
-- 当前本地验证最高分：**M26 epoch 003 + P18-global + P41（高密度相位集成），Score = 0.9638562171**。
+- 正式保守基线：**M26 epoch 003 + P18-global + P41（高密度相位集成），Score = 0.9638562171**。
+- 当前完整公开验证最高候选：**M111 + M124，Score = 0.9640370402**；该候选已通过一次完整验证，
+  但 M124 在训练 OOF 中存在目标组件误删风险，因此仍标记为提交候选，不把它描述为已证明的普适方案。
 - 验证集：EV-UAV Challenge 2 的 `val/`，共 24 个视频。
 - 当前生产推理：`event_count <= 30000` 使用 M10 epoch 002；其余视频使用 M26 epoch 003。
 - 当前固定后处理：P6 `0.718 / 0.7226`、P0/P0c、P18-global（无 event_count 上限）；P41 仅在
@@ -17,12 +19,14 @@
 当前最佳完整指标：
 
 ```text
-Score = 0.9638562171
+Score = 0.9640370402
 Pd    = 0.9785804284
-IoU   = 0.9423022866
-Acc   = 0.9763227701
-Fa    = 4.6632902944e-06
+IoU   = 0.9425080419
+Acc   = 0.9762769938
+Fa    = 4.6129243890e-06
 ```
+
+上述指标对应 `M111 + M124` 提交候选；正式保守基线仍为 `Score=0.9638562171`。
 
 ## 阅读顺序与当前研究约束
 
@@ -2138,3 +2142,1367 @@ M97 对正式 M10/M26 + P41 + P6 + P0/P0c 的已保留组件进行三次固定 9
 对事件稀疏扰动的敏感性高于背景伪警，稳定性不能作为当前组件的可靠质量指标。M97 路线停止：
 不再扫描保留比例、随机种子、重复次数或宽松门限，也不接入正式推理流程。完整报告保留在
 `log/analysis/eval_m97_stability_filter_oof.py` 和 `log/analysis/m97_stability_filter_oof.json`。
+
+## M98：无标签逐视频候选元选择器（否决）
+
+M98 尝试把队友方案中的逐视频调优改造成不依赖测试标签的自适应选择：固定 12 个候选
+（正式 P41 路由、原流/相位流/max/融合流、P18 参数变体和两个阈值变体），仅使用整段视频
+可观察的事件密度、分数分位数、双流差异和空间覆盖统计，通过固定五折视频级 Ridge 预测
+候选收益；预测收益低于 `0.00020` 时回退正式基线。候选收益计算使用训练标签只用于 OOF
+诊断，推理特征不含视频名、target id 或标签。
+
+首次回放发现基线实现错误地对低密度视频也使用了 P41 相位融合，导致结果与正式方案不一致。
+修正为 `event_count <= 30000` 使用原流、仅高密度视频使用 `0.75*原流 + 0.25*相位流` 后，
+完整 99 视频 OOF 的正式基线恢复为 `Score=0.9256642714`，与既有训练 OOF 对齐。
+
+修正后的完整五折 OOF：
+
+| 指标 | 正式基线 | 元选择器 | 增量 |
+| --- | ---: | ---: | ---: |
+| Score | 0.9256642714 | 0.9250068265 | -0.00065744 |
+| Pd | 0.9635879218 | 0.9635385830 | -0.00004934 |
+
+五折中 4 折 Score 下降，仅第 3 折有极小提升；选择器最终在 99 个视频中选择基线 56 次、
+融合/阈值等非基线动作 43 次，说明无标签统计不足以可靠判断低 Fa 与目标召回的权衡。
+M98 路线停止：不扩大候选菜单、不调整 Ridge 超参数、不增加训练轮次，也不接入正式推理流程。
+脚本和结果保留在 `log/analysis/m98_meta_selector_oof.py`、
+`log/analysis/m98_meta_selector_oof_fixed.json`，smoke 结果在
+`log/analysis/m98_meta_selector_smoke_fixed.json`。
+
+## M99：冻结中心提议器的时间持久性门控（否决）
+
+M95 的独立中心热图在逐事件 OR 时 calibration 有少量目标恢复，但背景组件比例过高。M99 不改 M26
+event logits，也不训练新模型，只固定要求热图峰值在相邻 3 个时间箱中全部具有同一空间区域支持（阈值
+`0.50`、半径 `8 px`、3/3 支持），再把候选映射回原始事件。该规则的目的，是把 M95 的事件级候选改成
+时间窗级候选，降低背景组件；参数不按验证标签扫描。
+
+首个 2/3 支持版本只作为诊断：calibration 的 Score 增量为 `+0.00088650`、Pd 增量 `+0.00221076`，
+但新增背景组件/恢复目标窗为 `6/9=0.667`，未达到预设 `<=0.5`，未进入 outer。随后唯一一次收紧为 3/3
+支持：
+
+| 折 | Score 增量 | Pd 增量 | Fa 增量 | 恢复目标窗 | 新增背景组件 | 背景/目标 | 结论 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| calibration | +0.00051129 | +0.00122820 | +7.05e-09 | 5 | 2 | 0.40 | 通过 calibration |
+| outer 0 | -0.00006370 | +0.00112360 | +1.46e-07 | 4 | 38 | 9.50 | 否决 |
+
+outer 中新增背景主要集中在单个视频，说明时间连续性本身不能控制未知视频的背景共现；虽然 Pd 上升，Fa/IoU
+损失使 Score 下降。M99 路线停止：不再扫描 2/3、3/3 以外的支持数、空间半径、热图阈值或时间窗口，
+不进行完整五折、不接入正式推理流程。脚本与结果保留在 `log/analysis/m99_center_persistence_oof.py`、
+`log/analysis/m99_center_persistence_oof.json` 和 `log/analysis/m99_center_persistence_3of3.json`。
+## M100/M101：队友组件级纯 FP 分类器的跨视频泛化审查
+
+动机：队友方案的 `0.9681` 主要来自使用验证标签逐视频选择 M10/M20/max、阈值、P0/P0c/P18 变体和分数缩放；其组件级纯 FP 删除也使用了验证标签做视频级策略选择。测试阶段只有视频、没有标签，因此不能直接搬用 `selection_main.json` 或按视频名映射。
+
+M100 在 99 个训练视频的冻结 P0/P0c 组件上重建队友 16 维可观测特征，并加入几何/运动特征，使用真正的 `GroupKFold(n_splits=5)`，不让同一视频组件跨训练/OOF。随机森林的 OOF 结果：固定纯 FP 概率门槛 `0.90` 时 pooled Score `0.9256643 -> 0.9286591`（`+0.0029948`），5 折分别为 `+0.0001950/+0.0087417/0/+0.0040574/+0.0004892`，Pd 每折不变，删除目标组件为 0；GBDT 也有训练域增益，但删除了目标组件且有一折 Pd 下降。该结果只说明训练域存在可观测背景组件信号，不足以证明测试域可迁移。
+
+M101 固定 M100 的 RF、21 维特征和 `FP probability >= 0.90`，用 99 个训练视频全量拟合后只在 24 个公开验证视频回放一次，不用验证标签拟合或调参。结果：
+
+```text
+baseline Score=0.9638562171 Pd=0.9785804284 Fa=4.6632902944e-06
+gated    Score=0.9638562171 Pd=0.9785804284 Fa=4.6632902944e-06
+removed components=0, removed target components=0
+```
+
+结论：拒绝 M100/M101 进入生产。训练 OOF 的正增益在域外变成“零触发”，与 M74/M81 的组件门控失败一致；继续扫 RF/GBDT、阈值或按验证集挑选门槛属于重复过拟合。队友 `0.9681` 可以作为带标签验证集的上限参考，但不能作为标签隐藏测试集的普适分数。
+
+## M102：RF 组件概率的每视频排名门（否决）
+
+为避免 M101 因概率校准域移位而“零触发”，尝试更窄的无标签规则：每个视频最多删除 RF 预测纯 FP 概率最高的 1 个组件。严格按视频 GroupKFold 的 99 个训练视频 OOF 中，最高组件只有 `41/99` 个视频确实为纯 FP，`58/99` 个视频会误删目标；前 2 个组件仅 `23/99` 个视频能保证不误删目标。未进行验证集回放，规则直接否决。
+
+## M103：真实 M20 分数源与 M26/P41 的固定候选扫描（否决）
+
+M98 的候选路由只使用了 M26 原流/相位视图，没有真正加入 M20 checkpoint。现利用已有 24 个验证视频的 M20 原始分数缓存，固定复核 M20、M26/P41、逐事件 max 和两种全局融合；不做逐视频标签选择：
+
+| 固定候选 | Score | 相对 P41 |
+| --- | ---: | ---: |
+| M26/P41（当前） | **0.9638562171** | 0 |
+| M20 | 0.9634247606 | -0.0004314565 |
+| max(P41, M20) | 0.9631977825 | -0.0006584345 |
+| P41 75% + M20 25% | 0.9637573715 | -0.0000988455 |
+| P41 50% + M20 50% | 0.9635936452 | -0.0002625718 |
+
+结论：M20 只可能在少数视频的标签调优中有互补，固定使用或融合均不如 P41；没有理由再为 M20 补跑 99 个训练视频并训练路由器。队友逐视频表的收益仍属于标签侧选择，不能转化为当前测试规则下的可靠提分。
+## M104：同一时空 cell 的高置信支持补齐（否决）
+
+当前 P41 路由先按事件独立阈值化，再进入 P0/P0c/P18。M104 检查一个尚未单独验证的窄场景：同一
+`(x, y, floor(t/50))` cell 内已经有高置信事件时，该 cell 的其他低分事件是否只是被阈值截断。规则不做
+空间或时间邻域膨胀，只在 cell 内存在 `score >= gate` 的事件时，把同 cell 的低分事件分数抬到该视频固定
+决策阈值（低密度 `0.718`，高密度 `0.7226`）。模型、P41 权重、P0/P0c/P18 几何均不改变，也不使用视频名、
+标签或逐视频策略。
+
+实现和复现：`log/analysis/m104_cell_support_fill.py`，结果：
+`log/analysis/m104_cell_support_fill.json`。验证缓存的 `idx_label` 格式与 P41 分数缓存不同，脚本已按
+M103 的方式用 `m20_e3_m10low30000_raw_scores.pt` 承载验证元数据，并逐视频检查事件数和位置完全一致，避免
+把 Pd 错算成 `0.99557`。
+
+训练缓存固定回放（P41 正式后处理基线 `Score=0.9256642714`）：
+
+| 高置信 gate | Score | Pd | Fa | 改动事件 | 改动目标事件 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| `0.90` | `0.9256584898` | `0.9635879218` | `1.1407994083e-05` | 10 | 0 |
+| `0.95` | `0.9256642714` | `0.9635879218` | `1.1407994083e-05` | 0 | 0 |
+
+`0.90` 的 Score 下降，`0.95` 没有产生任何变化；两者都未达到“Score 至少增加 `0.00010`、Pd 不降、Fa
+不升”的训练域安全门槛，因此不进入验证回放，不扫更多 gate、不改为邻域膨胀、不增加事件填充范围。该方向
+停止，不接入正式 `0.9638562171` 方案。
+## M105：超高密度子路由的 P41 权重（否决）
+
+P41 的 `0.75/0.25` 原流/半箱相位融合已在 `event_count > 30000` 全高密度路由上验证有效，但此前全局权重扫描不能
+排除超高密度视频与普通高密度视频的误差机制不同。M105 预先固定已有 dense 路由使用的可观察边界
+`event_count > 200000`：中密度继续严格使用正式 `0.75/0.25`，仅超高密度段改用原流权重 `0.50` 或 `0.90`。
+不按视频名、标签或验证结果选择，模型和后处理均不变。
+
+实现和结果：`log/analysis/m105_density_phase_weight.py`、`log/analysis/m105_density_phase_weight.json`。
+训练缓存固定回放的正式基线为 `Score=0.9256642714`：
+
+| `event_count > 200000` 原流权重 | Score | Pd | Fa |
+| ---: | ---: | ---: | ---: |
+| `0.50` | `0.9253314348` | `0.9637852773` | `1.1515589601e-05` |
+| `0.90` | `0.9251177042` | `0.9638346161` | `1.1570104661e-05` |
+
+两个候选均同时降低 IoU/Score 并升高 Fa，未通过预注册的训练域安全门槛（Score 至少 `+0.00010`、Pd 不降、Fa
+不升），因此不进入验证集回放，不继续切分更多 event-count 区间，也不扫描其它权重。正式方案保持
+`0.9638562171`。
+
+## M106：ROC 排除事件单调补回（否决）
+
+`utils/eval.py::roc_update` 对每个 50-unit 时间窗使用严格开区间，故精确边界事件不参与 `Pd/Fa`，但仍参与
+事件级 `IoU/Acc`。M106 首先以 `utils/boundary_recovery.py` 逐区间复刻该评估器语义；`t=[49,50,51]` 的
+parity 单测确认只有 `49` 被纳入 ROC。它不直接复用只处理 `t % 50` 的训练损失近似 mask，并要求浮点时间为
+无损整数表示。`tests/test_m106_boundary_recovery.py` 还确认：在 P0/P0c/P18 后仅对 ROC 排除的当前负事件做
+单调 OR 时，`Pd/Fa` 保持不变。
+
+训练集 99 视频缓存 `log/analysis/m74_component_quality/train_p41_scores.pt` 的正式 P41 + P6 + P0/P0c +
+P18-global 回放精确复现基线 `Score=0.9256642714`、`Pd=0.9635879218`、`IoU=0.8770307899`、
+`Acc=0.9716695547`、`Fa=1.1407994083e-05`。分折严格读取 `log/analysis/m75_video_folds.json` 的显式 `fold`
+字段（当前文件 SHA256 为 `b7c66f2dd6bbcf494ff0cc35216f7ed81942bdb99d3e4b3fbe5cb34f93961712`），不按 record index
+取模。候选固定为每视频 P6 阈值减去 `delta in {0.00,0.02,0.04,0.07,0.12}`，补回只读取 P0/P18 前的冻结
+P41 分数；没有重新推理模型、没有读取公开验证标签。
+
+| delta | Score 增量 | IoU 增量 | Acc 增量 | Pd/Fa 增量 | 补回目标 / 全部事件 | 精度 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `0.00` | `-0.00008147` | `-0.00049675` | `+0.00017875` | `0 / 0` | `49 / 277` | `17.69%` |
+| `0.02` | `-0.00011680` | `-0.00069159` | `+0.00021523` | `0 / 0` | `59 / 366` | `16.12%` |
+| `0.04` | `-0.00015743` | `-0.00091481` | `+0.00025535` | `0 / 0` | `70 / 467` | `14.99%` |
+| `0.07` | `-0.00022196` | `-0.00127029` | `+0.00032103` | `0 / 0` | `88 / 629` | `13.99%` |
+| `0.12` | `-0.00035242` | `-0.00195360` | `+0.00038302` | `0 / 0` | `105 / 903` | `11.63%` |
+
+五个固定视频折在每个 delta 均 Score 下降，故没有候选满足 pooled `Score >= +0.00010`、至少 4/5 折不降及
+`Pd/Fa` 不变的全部准入条件。虽然评估器不变量成立，冻结分数在 ROC 排除集上的筛选精度远低于事件级
+IoU 盈亏平衡；M106 因此停止，不进行公开验证回放、不接入 `test2.py` 或提交代码、不扩大 delta 网格或增加
+其他边界/尾部规则。结果：`log/analysis/m106_boundary_recovery_train_oof.json`，缓存回放：
+`log/analysis/eval_m106_boundary_recovery.py`。
+
+## M107：M95 固定 0.50 阈值的 outer-0 真实 Score 审计（否决）
+
+M95 曾在 calibration fold 因“新增背景组件/恢复目标窗 <= 0.5”的代理门槛失败，而其固定 heatmap threshold
+`0.50` 的完整 calibration Score 增量为 `+0.00097799`。为避免该代理门槛错误否定真实 Score，M107 仅进行
+一次事后预固定审计：复用 `log/m95_frozen_center_outer0_seed95.pt`，固定 outer=0、calibration=1、阈值 `0.50`，
+不重训、不扫其它阈值或映射几何、不读取公开验证集。
+
+checkpoint metadata 审计确认 33 个训练视频、20 个 calibration 视频和 19 个 outer 视频均与
+`m75_video_folds.json` 的显式名单一致，outer 0 未参与 head 训练；M26 checkpoint SHA256 也与当前正式
+checkpoint 一致。冻结主干接口重建的 logits 逐元素等于发布路径，且翻转标签/target id 不改变 M95 heatmap 或
+event mapping。随后只读取 outer-0 标签做一次完整生产 P41 + P6 + P0/P0c + P18 后的单调 OR Score：
+
+| 配置 | Score 增量 | Pd 增量 | IoU 增量 | Acc 增量 | Fa 增量 | 恢复目标窗 | 新增背景组件 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| M95 fixed `0.50`, outer 0 | `-0.00032793` | `+0.00168539` | `-0.00119609` | `+0.00021368` | `+2.8098e-07` | `6` | `73` |
+
+没有达到唯一准入条件 outer Score `>= +0.00010`，且背景组件数明显高于 calibration 的 7 个。这证实 M95 的
+calibration 正增益不具备跨视频泛化。M107 永久停止：不训练其余 outer heads、不做五折 OOF、不接入公开验证或
+提交、不再调整 M95 阈值、持续性、候选数或 verifier。结果：`log/analysis/m107_m95_outer0_fixed.json`；执行入口：
+`log/analysis/eval_m107_m95_outer0_fixed.py`。
+
+## M108：持久 Track-Query 对象级 seed（否决）
+
+M108 是在 M106/M107 均失败后新增的对象级路线。它保持正式 M10/M26 + P41 + P6 +
+P0/P0c + P18-global 完整不变：冻结 M26，每个 50-unit 时间箱从 H/4 decoder feature
+读取输入，以固定 8 个 query 跨整段视频传播，输出每 query/bin 的 existence、centre、scale 和
+velocity。训练时仅用训练视频标签和 `target_id` 建立完整轨迹 Hungarian 一对一匹配；未匹配 query
+使用 no-object loss。测试时 query 只读取事件流和冻结特征，且只在 P18 后对当前负事件单调补 seed：
+每 query/bin 至多一个，优先非 `t % 50 == 0` 事件，再按固定 P41 分数、空间距离和事件 index 排序。
+
+第一次也是唯一一次 probe 固定为 outer fold 0、calibration fold 1、seed `108`、5 epochs、8 queries、
+hidden `32`、presence threshold `0.50`。训练集只包括其余三折 `event_count > 30000` 的 33 个视频；
+完整视频冻结特征仅缓存为 CPU `float16`，M26 全程 `no_grad`。checkpoint 记录 M26 SHA256、manifest
+SHA256、训练/calibration/outer 三组完整视频名单；评估启动时逐项核验。翻转一个 calibration 视频的
+labels/target ids 后，M26 feature、query 输出与 seed indices 均逐元素相同，确认推理不读取标签。
+没有使用公开验证视频，也没有扫描 threshold、半径、query 数、epoch、seed 或任何候选后处理参数。
+
+outer-0 使用正式生产 P6/P0/P0c/P18 后的单调 OR 回放，结果如下：
+
+| 指标 | 正式基线 | M108 | 增量 |
+| --- | ---: | ---: | ---: |
+| Score | 0.9317213466 | 0.9037590607 | `-0.0279622859` |
+| Pd | 0.9553370787 | 0.9564606742 | `+0.0011235955` |
+| IoU | 0.8748116493 | 0.8285170794 | `-0.0462945700` |
+| Acc | 0.9512525201 | 0.9517273903 | `+0.0004748702` |
+| Fa | 7.0783999e-06 | 1.4195290e-05 | `+7.1168904e-06` |
+
+query 共新增 2,603 个事件，仅恢复 4 个目标时间窗，却引入 1,851 个背景组件（每恢复窗
+462.75 个）。背景主要集中于 `train_089`、`train_091` 和 `train_095`，表明训练时的轨迹级
+身份匹配没有带来跨视频所需的候选精度。未达到预注册 outer Score `>= +0.00050` 门槛，故 M108
+永久停止：不训练其余 outer heads、不做五折 OOF、不使用公开验证集、不调整 presence threshold、
+query 数、训练轮次、尺度范围、映射半径或 seed 规则，也不接入提交。实现位于
+`model/track_query_net.py`、`utils/track_query.py`、`train_track_query.py`、
+`log/analysis/eval_m108_track_query_outer.py`；checkpoint 为
+`log/m108_track_query_outer0_seed108.pt`，完整结果为
+`log/analysis/m108_track_query_outer0.json`。
+
+### M108 部署映射复查：修正候选吸附问题，但方向仍否决
+
+事后代码审计发现 M108 的 seed 映射存在一个真实的实现缺陷：query 中心原本可以吸附任意原始分数的当前负
+事件，完全没有候选质量底线。这会把一个对象级 query 扩散为大量低分背景事件。
+`utils/track_query.py::track_query_seed_indices` 现已增加可选 `minimum_raw_score`，并补充底线过滤与
+标签不变性测试；默认 `None` 保持旧行为，未接入正式推理。
+
+只在原 calibration fold 1 上，用既有 P18 固定候选底线 `0.53` 做一次诊断，不扫描其它阈值：
+
+| M108 映射规则 | Score 增量 | Pd 增量 | Fa 增量 | seeds | target seeds | 恢复目标窗 | 新背景组件 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 原规则，无底线 | -0.0254880642 | 0 | +6.8805e-06 | 2741 | 10 | 0 | 1966 |
+| 原始 P41 分数 `>=0.53` | -0.0011221763 | 0 | +3.0682e-07 | 125 | 8 | 0 | 92 |
+
+修正确实将损失降低了一个数量级，说明原部署操作有问题；但它仍未恢复任何目标窗，Score 仍下降。existence
+概率也几乎坍缩为常数：`p10=0.755509`、`p50=0.756038`、`p90=0.756925`，无法提供有效候选排序。
+因此 M108 的最终结论不变：实现缺陷已修正，核心表征方向仍失败，不再扫描 threshold、epoch、query 数或半径。
+诊断脚本与结果为 `log/analysis/diagnose_m108_calibration.py` 和
+`log/analysis/m108_calibration_mapping_diagnosis.json`。
+
+## M110：固定极性反转 TTA（否决）
+
+M110 验证一个历史未单独测试的无标签固定视图：将 OFF/ON 极性互换，保持事件索引、坐标和时间完全不变，
+分别通过正式 M10/M26 + P41 路由，再以固定 `0.5/0.5` 概率平均。该规则只读取事件流，不读取视频名、标签或
+target id；只在训练 outer fold 0 做一次筛选，不扫描权重，也不访问公开验证集。
+
+| 配置 | Score | Pd | IoU | Acc | Fa |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| outer-0 正式基线 | 0.9317213466 | 0.9553370787 | 0.8748116493 | 0.9512525201 | 7.0783999e-06 |
+| 原流/极性反转流 `0.5/0.5` | 0.9146564796 | 0.9193820225 | 0.8630773425 | 0.9348450899 | 6.6126650e-06 |
+| 增量 | **-0.0170648669** | **-0.0359550562** | -0.0117343068 | -0.0164074302 | -4.6573485e-07 |
+
+极性反转虽略降 Fa，却严重破坏 Pd、IoU 和 Acc，属于视图分布不等价造成的方向性失败，而非实现或参数问题。
+M110 停止，不扫融合权重、不跑公开验证。实现、几何测试和结果分别在
+`utils/temporal_memory_inference.py`、`tests/test_m110_polarity_tta.py`、
+`log/analysis/m110_polarity_tta_outer0.json`。
+
+## M111：M49/M58 三独立种子相位专家等权平均（保留为隐藏测试候选）
+
+复核已有 checkpoint 后，M49/M58 是近期唯一在三个独立训练 seed 上都超过正式 P41、且 Pd 均不下降的信号。
+为降低挑选最佳 seed 的验证集偶然性，M111 不训练、不扫描组合或融合权重，只将 seed 72、73、76 的同架构
+`model_state_dict` 做一次固定等权平均；推理成本仍等同一个相位专家。
+
+`log/analysis/build_m111_phase_specialist_average.py` 对 96 个 state tensor 严格检查 key、shape 和 dtype；浮点
+tensor 先转 `float64` 求均值再转回原 dtype，非浮点状态必须逐元素相同，并保留 seed72 的 temporal-memory
+架构 metadata。候选 checkpoint 为
+`log/analysis/m111_phase_specialist_seed72_73_76_average.pt`，SHA256：
+`15fd690e3bb177649f2a995aaf00b947fd6ac0dfb147ea6a9cdf5847b96aded2`。
+
+完整 24 视频验证严格保持 M10/M26、P41 `0.75/0.25`、P6 `0.718/0.7226`、P0/P0c 和 P18-global 不变，
+只用 M111 替换 `event_count > 30000` 的 P41 半箱偏移视图：
+
+| 配置 | Score | 相对正式基线 | Pd | IoU | Acc | Fa |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 正式 P41 | 0.9638562171 | 0 | 0.9785804284 | **0.9423022866** | **0.9763227701** | 4.6632902944e-06 |
+| M49 seed72 | **0.9638883076** | +0.0000320905 | 0.9785804284 | 0.9423431158 | 0.9763075113 | **4.6544021934e-06** |
+| M49 seed73 | 0.9638725759 | +0.0000163588 | 0.9785804284 | 0.9423145056 | 0.9762922525 | 4.6573648938e-06 |
+| seed72+73 权重平均 | 0.9638770462 | +0.0000208291 | 0.9785804284 | 0.9423292279 | 0.9763075113 | 4.6573648938e-06 |
+| M58 seed76 | 0.9638681055 | +0.0000118884 | 0.9785804284 | 0.9422997832 | 0.9762769938 | 4.6573648938e-06 |
+| **M111 三 seed 平均** | **0.9638681055** | **+0.0000118884** | **0.9785804284** | 0.9422997832 | 0.9762769938 | 4.6573648938e-06 |
+
+加载路径复核确认实际读取的是平均后的 `model_state_dict`；M111 只有 4 个初始化常量 tensor 与任一单 seed
+完全相同，其余均为三者平均。M111 与 seed76 的最终汇总指标相同，是阈值和 P0/P18 后处理离散化所致，并非
+误加载 checkpoint。
+
+结论：不能再称所有新方案都未提分。M111 在无 Pd 损失下有真实但极小的 `+0.0000118884`，且三个独立 seed
+方向一致，可保留为隐藏测试候选；但增益小于 `2e-5`，不足以单独证明跨域稳定性，因此暂不替换 README 的正式
+基线，也不继续扫描 seed 子集或专家权重。若比赛允许多版本提交，正式 P41 与 M111 应作为两个固定候选；若只能
+提交一个，M111 的三 seed 一致性使其略优先于挑选公开验证最好的 seed72。结构化结果为
+`log/analysis/m111_phase_specialist_average_full_verify.json`。
+
+## M112：M108 no-object loss 归一修正（操作问题已修，方向仍否决）
+
+继续审计 M108 的 existence 概率坍缩后发现第二个明确实现问题。固定 8 个 query 的 33 个训练视频平均只有
+`2.6061` 条目标轨迹，因此平均有 `5.4242` 个 unmatched query；旧 loss 却先把所有 unmatched query 的
+BCE 整体取均值，再把它作为单个 `0.25` 项与 matched losses 求平均。结果是每个空 query 的梯度又被
+unmatched 数量除小，无法达到“每个 no-object query 权重 0.25”的原始设计语义。
+
+`utils/track_query.py::track_query_loss` 现保留历史可复现的 `group_mean` 默认模式，并新增
+`per_query_weighted_mean`：每个 unmatched query 独立计算时间平均 BCE，按 `0.25` 加权，再按总权重归一。
+`train_track_query.py` 增加显式模式参数并写入 checkpoint metadata；单测确认全空 query 情况下，旧 loss 被
+稀释为标准 BCE 的 `0.25`，修正模式恢复为完整 BCE。
+
+M112 只用原 M108 完全相同的 outer-0/calibration-1 切分、33 个高密度训练视频、seed 108、8 queries、
+hidden 32 和 5 epochs 重训；唯一变化为上述 loss 归一。训练 loss 为
+`2.434722 -> 1.784075 -> 1.503314 -> 1.468966 -> 1.462623`。checkpoint：
+`log/m112_track_query_noobject_outer0_seed108.pt`，SHA256：
+`8d25d88473e6084a7c9c186e56c11f9b829daa5d26b6dc12bd810840e0281119`。
+
+只在训练未见的 calibration fold 1 上复用固定 `presence=0.50` 和唯一允许的 P18 `0.53` 底线：
+
+| 版本 | existence p10 / p50 / p90 | seeds | target seeds | 恢复目标窗 | 新背景组件 | Score 增量 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| M108 原 loss + `0.53` | 0.755509 / 0.756038 / 0.756925 | 125 | 8 | 0 | 92 | -0.0011221763 |
+| M112 修正 loss + `0.53` | 0.608524 / 0.609805 / 0.610778 | 147 | 9 | 0 | 104 | -0.0012829319 |
+
+修正使 existence 整体降低，证明 no-object 实现问题真实存在；但概率仍坍缩在极窄范围，所有主要输出仍高于
+`0.50`，没有恢复任何目标窗，Score 反而更差。因此 M112 不进入 outer fold 或公开验证，不扫描 presence
+threshold、no-object 权重或 epoch。最终判断是：M108 有两个已修正的操作缺陷，但即使修正，冻结 H/4 特征上的
+全局 query 仍不具备所需跨视频候选排序能力，核心方向不再投入。结果为
+`log/analysis/m112_track_query_noobject_calibration.json`。
+
+## M113：三相位专家概率等权集成（不采用）
+
+M111 是三个独立相位专家的权重平均；考虑非线性网络中输出集成通常比参数平均稳定，M113 做最后一个固定
+相位专家实验：M26 原流保持 `0.75`，seed 72/73/76 分别对 offset 25 相位流推理，三个概率以固定 `1/3`
+等权平均后占 `0.25`。不扫描 checkpoint 子集、模型权重、P41 权重或阈值；规则只读取事件流，满足隐藏测试
+无标签约束。
+
+隔离脚本 `log/analysis/eval_m113_phase_specialist_score_ensemble.py` 在同一次 24 视频运行中重新计算正式 P41
+基线和 M113，基线精确回归 `Score=0.9638562171`。结果：
+
+| 配置 | Score | 相对正式基线 | Pd | IoU | Acc | Fa |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 正式 P41 | 0.9638562171 | 0 | 0.9785804284 | 0.9423022866 | 0.9763227701 | 4.6632902944e-06 |
+| M111 三 seed 权重平均 | 0.9638681055 | +0.0000118884 | 0.9785804284 | 0.9422997832 | 0.9762769938 | 4.6573648938e-06 |
+| M113 三 seed 概率平均 | 0.9638681055 | +0.0000118885 | 0.9785804284 | 0.9422997832 | 0.9762769938 | 4.6573648938e-06 |
+
+M113 与 M111 在已报告 10 位精度的 IoU、Acc、Pd、Fa 和 Score 上全部一致；脚本最初用本次未舍入 Score 与
+M111 的 10 位小数常量直接比较，曾错误显示 `beats_m111=true`，现已增加 `5e-10` 报告精度容差并修正为
+`false`。相对正式 P41，最终只在 2 个视频移除 6 个事件，其中 3 个目标、3 个背景，Pd 不变。
+
+结论：概率集成没有在 M111 上增加任何可分辨分数，却把高密度相位分支从一次增加到三次推理；完整运行耗时
+约 6 分 12 秒，约为 M111 的两倍。M113 不采用，也不再尝试 seed 子集、非等权融合或逐视频专家选择；继续保留
+推理成本等同单专家的 M111 作为隐藏测试候选。完整结果：
+`log/analysis/m113_phase_specialist_score_ensemble.json`。
+
+## 2026-08-19 榜单目标复核
+
+当前榜单截图显示第 5 名为 `Score=0.9701, Pd=0.9832, Fa=3.45e-06, IoU=0.9476,
+Acc=0.9745`；前三名已达到 `0.9734--0.9825`，榜首为 `Pd=0.9840, Fa=8.8e-07,
+IoU=0.9694, Acc=0.9768`。相对正式基线 `0.9638562171`，仅达到第 5 名大约也需要同时完成
+`Pd +0.0046`、`Fa -26%`、`IoU +0.0053`。榜单还说明 `Acc` 不必绝对单调：第 5 名 Acc 比本项目低约
+`0.0018`，但靠 Pd/Fa/IoU 的组合获得更高总分；后续准入应以独立验证的最终 Score 为主，而不是机械要求任何
+目标事件都不能损失。
+
+## M114：精确 Score 误差预算（诊断）
+
+`log/analysis/eval_m114_score_oracle.py` 精确回归正式基线，并重建出 4,762 个目标窗（命中 4,660、漏检
+102）、1,574 个官方虚警组件、2,365 个 FP events 和 63,955 个 TP events。若固定当前预测，只按标签 oracle
+从大到小删除虚警组件，最少需删除 356 个（22.62%，合计 1,102 个 FP events）才能刚达到
+`Score=0.97000268`。旧 P0 轨迹粒度即使完美分类也只有 `0.96732555`；最终逐 50-unit 细组件完美去背景可达
+`0.98097123`，固定预测完美去背景可达 `0.98432900`，固定预测完美补召回可达 `0.97936221`。因此细组件
+具有理论杠杆，但粗轨迹 veto 本身不可能把当前基线推到 0.97。结果：
+`log/analysis/m114_score_oracle.json`。
+
+## M115：最终细组件手工特征 verifier（独立验证仅微增）
+
+M115 对 P0/P0c/P18 后每个 50-unit 的最终 8 连通组件提取 35 个无标签分数、几何和邻窗特征，按视频做五折
+OOF ExtraTrees。训练域 53,305 个组件中有 14,195 个纯背景，OOF `ROC-AUC=0.90377`、
+`PR-AUC=0.77329`。固定 `p_bg>=0.95` 在五个 OOF 折全部提高 Score，池化增量 `+0.002732`，但误删
+64 个含目标组件，`Pd -0.000493`、`Acc -0.000332`。榜单表明这点损失理论上可接受，因此 M120 没有再扫
+阈值，只将这一既有 `0.95` 策略用全 99 训练视频拟合后在 24 个公开验证视频评一次：只删除 3 个纯背景组件、
+0 个目标组件，`Score +0.0000337833`、`Pd/Acc` 不变。真实增益远小于目标，拒绝部署，也不放宽至 `0.90`。
+结果：`log/analysis/m115_fine_component_probe.json`、
+`log/analysis/m120_m115_fixed95_validation.json`。
+
+## M116--M119：冻结 RVT-Tiny 细组件表征（训练 OOF 通过，独立验证否决）
+
+M116 使用 Gen1 目标检测预训练的 RVT-Tiny（checkpoint SHA256
+`05f67827744575fac7f840508d360bdeb16d25302e06165c53b6e84b3ef305f9`），从原始 `(x,y,t,polarity)`
+构造 10 微时间箱双极性 histogram，完整递归 160 个 50-unit step，并在最终组件中心采样四层共 928 维特征。
+输入不含视频名、标签或 target id。99 个训练视频全部缓存仅耗时 338.6 秒，严格对齐 53,305 个组件，峰值显存
+约 42 MiB。
+
+首次严格 nested probe 用 folds 2/3/4 拟合三个小 MLP、fold 1 以零目标误删冻结 `target-max + 0.5` 阈值、
+fold 0 只评一次：安全删除 110/0 个背景/目标组件，`IoU +0.005865`、`Score +0.002359`、Pd 不变。
+扩展折验证却发现严重 logit 域移：一个 split 的 calibration 在 `+1.0` 裕量下安全提升 `+0.007363`，对应
+outer 却误删 497 个目标组件，`Pd -0.02010`、`Score -0.01652`。该失败主要集中在 logit 整体上移的高密度
+视频，并非普通 AUC 不足。
+
+M117 固定 `video median logit <= 0` 作无标签可靠性门，五折池化仅 `Score +0.000488` 且仍误删 1 个目标
+组件，否决。M118 修正为更严格的 calibration-support gate：组件阈值始终保留完整 calibration 的
+`target-max + 1.0`，仅当视频 median logit 不超过 calibration 视频最大 median 时启用。五折 OOF 安全删除
+480/0，全部折非降，`IoU +0.004668`、`Score +0.001865`、Pd 不变；但这是看到 M116 域移后提出，不能作为
+独立证据。
+
+M119 在读取公开验证标签前固定五头 3/5 多数票，每头沿用自己的阈值和 support gate。24 个独立验证视频上，
+前四头没有任何组件超过阈值，第五头仅有 16 个单票，最终没有组件达到多数票，所有指标完全不变。标签只读诊断
+显示验证 `ROC-AUC=0.85--0.90`，但各头在验证域的零误伤尾部最多只能删除 13 个背景组件，证明问题不是再做
+阈值平移即可解决。冻结当前输出后附加组件 verifier 的跨域杠杆不足，M116--M119 停止，不再扫 margin、视频门
+或投票数，不接入正式推理。实现与结果：
+`utils/rvt_component_features.py`、`log/analysis/cache_m116_rvt_component_features.py`、
+`log/analysis/run_m116_rvt_component_probe.py`、`log/analysis/eval_m117_rvt_video_gate_oof.py`、
+`log/analysis/eval_m118_rvt_support_gate_oof.py`、`log/analysis/eval_m119_rvt_consensus_validation.py`、
+`log/analysis/m119_rvt_consensus_validation.json`。
+
+当前结论：现有输出上的事后 verifier 最多只产生 `1e-5--1e-4` 级独立验证增益，无法承担从 `0.96386` 到
+`0.97` 的主提升。下一条主线必须改变主模型学到的像素/事件决策边界，同时提高召回和分割质量；不能继续围绕
+冻结 P41 分数扫描组件分类阈值。
+
+## M121：端到端 RVT 事件残差（公开验证否决）
+
+M121 将 Gen1 预训练 RVT-Tiny 从事后组件特征器改为逐事件残差网络：RVT 多尺度特征经 FPN 输出 logit
+残差，并加到冻结 P41 基线 logit 上。输出层零初始化，所以训练开始时严格等于正式基线；推理只读取事件
+`(x,y,t,polarity)` 与基线分数，不读取视频名、标签或 target id。为隔离选择偏差，固定 folds 2/3/4
+训练、fold 1 选 epoch、fold 0 一次性 outer 评估，只有通过 outer 才允许看公开验证。
+
+calibration fold 1 选择 epoch 8，`Score +0.01539688`；outer fold 0 仍有 `Score +0.00109834`，因此按预先
+规则只在完整 24 视频公开验证评估一次。公开验证却为 `Score -0.00635301`，主要来自几乎全负残差造成的
+`Pd -0.01974`：网络学会了跨样本压低基线分数，却没有学到可跨域定位的增益。M121 不部署，也不继续扫描
+epoch、残差缩放或阈值。训练目录：`log/m121_rvt_residual_outer0/runs/20260819-214808_seed121`。
+
+## M122：正样本残差保持（outer fold 否决）
+
+M122 只在 M121 原损失上增加 `positive_preservation_weight=0.05`：对训练正事件上的负残差施加平方惩罚；
+架构、数据切分、seed、优化器和选择协议完全不变。calibration fold 1 选择 epoch 4，得到
+`Score +0.0077648470`、`Pd -0.0051584377`、`IoU +0.0138249397`、`Acc -0.0058280826`、
+`Fa -2.8636529e-06`。训练 epoch 1 曾出现一次 AMP 非有限梯度范数，GradScaler 自动跳步，之后未复现。
+
+固定 epoch 4 在训练与选 epoch 均未见的 outer fold 0 一次性评估结果如下：
+
+| 配置 | Score | Pd | IoU | Acc | Fa |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| outer-0 正式基线 | 0.9317213466 | 0.9553370787 | 0.8748116493 | 0.9512525201 | 7.0783999e-06 |
+| M122 epoch 4 | 0.9311224482 | 0.9477528090 | 0.8766549826 | 0.9448890090 | 6.1161378e-06 |
+| 增量 | **-0.0005988984** | **-0.0075842697** | +0.0018433332 | -0.0063635111 | -9.6226208e-07 |
+
+正样本保持减轻了 M121 的召回坍缩，但没有改变核心泛化问题：校准折的大幅提升在 outer fold 反向，仍以过多
+目标损失换取 Fa/IoU。按预先停止规则，不访问公开验证、不扫描保持权重，也不训练全量候选。M121/M122 共同
+否决“冻结 P41 上叠加单向 RVT 残差”这条损失路线；若继续端到端主模型，必须改成能显式学习新增真阳性与空间
+边界、并在多个 held-out 视频折稳定通过的双向预测任务，而不是继续调抑制强度。结果：
+`log/analysis/m121_validation_epoch8.json`、`log/analysis/m122_calibration_selection.json`、
+`log/analysis/m122_outer0_epoch4.json`。
+
+## M123：objectness-gated temporal-memory（单一 outer 哨兵通过，未扩展）
+
+M123 在 M26 decoder 的原始分辨率特征上增加 target-centre、presence 和 velocity
+objectness 分支，并让 objectness 通过零初始化、受限 `0.5*tanh` event residual 真正进入事件
+logits。冻结 M26 teacher、teacher SmoothL1 和正事件保持损失用于防止全局降分；关闭该分支时旧接口和
+checkpoint 行为保持不变。训练时可用 `m75_video_folds.json` 按视频名严格过滤 outer train folds，推理
+函数只接收事件流，不接收 labels/target ids。
+
+已通过零初始化 identity、梯度、标签隔离、checkpoint 回读和合成训练检查。随后按预先固定的
+outer=0 / calibration=1 / train=2,3,4 划分，完成 12 epoch 的一次哨兵训练；calibration 只用于选取
+`epoch=8`、`gate_strength=0.25`，再一次性读取 outer 标签。结果为：calibration `Score +0.00315372`，
+outer `Score +0.00153217`、`Pd +0.00028090`、`IoU +0.00271255`、`Fa -3.4641e-07`，teacher 正事件保持率
+`99.9961%`，满足该哨兵的预设门槛。
+
+这只是一个 training-video outer 折，不是公开验证或五折 OOF 证据。完整五折需要五次独立 12-epoch
+训练，成本很高；在没有第二个哨兵折和独立验证确认前，不应把它写入正式方案、更不应据此扫描 gate、epoch 或
+seed。结果为 `log/analysis/m123_objectness_outer0.json`，训练目录为
+`log/m123_objectness_outer0_seed123/`，审计入口仍是 `log/analysis/eval_m123_objectness_outer.py`。
+
+## M124：长期背景重复活动特征（早期安全策略未部署）
+
+M124 不改 checkpoint，只在 P41 + P6 + P0/P0c + P18-global 后的最终 50-unit 细组件上，利用完整无标签事件流
+计算像素长期计数、活动时间箱占比、排除当前局部窗口后的重复活动和 3x3 邻域长期活动。99 个训练视频、53,305
+个组件的跨视频五折诊断显示，这不是 M71/M72 已否定的局部统计重复：
+
+| 长期特征 | pooled AUC | 五折中位 AUC | 方向一致性 |
+| --- | ---: | ---: | ---: |
+| 当前局部窗口外的像素重复活动占比 | 0.7391 | 0.7171 | 100% |
+| 3x3 邻域长期活动时间占比 | 0.7064 | 0.6842 | 100% |
+| 像素长期活动时间占比 | 0.6960 | 0.6768 | 100% |
+
+单个三折 ExtraTrees 头用相邻 calibration 折的“目标组件最大概率 + 1e-6”作为唯一固定安全阈值时，长期特征
+单独 OOF `Score +0.00257368`，但仍误删 10 个含目标组件；与 M115 特征合并虽到 `+0.00286410`，仍误删 15 个。
+所以当时的 M124 只证明长期重复背景是新信号，不能直接接入后处理。后续 M111 + M115/M124 的更宽松
+固定阈值候选及其 OOF 风险见文末。脚本和结果为 `log/analysis/analyze_m124_long_horizon_background.py`、
+`log/analysis/m124_long_horizon_background.json`。
+
+## M125：长期背景的跨折一致性安全门控（训练 OOF 接近门槛）
+
+为消除 M124 的目标误删，M125 对每个 outer 视频折同时训练 4 个 pair-excluded 头：每头只见其余 3 个折，
+各自在另一个未见 calibration 折以零目标删除阈值定标；最终组件必须被 4/4 头同时判为强背景才删除。没有阈值网格，
+也不使用视频名、验证标签或 target id。
+
+结果删除 319 个组件，全部为纯背景，目标组件误删为 0；五个 outer 折均为正，pool OOF `Score +0.00099480`、
+`Pd` 不变、`Fa -2.2739e-07`、`IoU +0.00192750`。它仅比预先写定的 `+0.0010` 门槛低 `5.2e-6`，因此不作为
+正式准入通过，但值得进行一次固定的独立验证映射，而不是再放宽阈值。实现与结果：
+`log/analysis/analyze_m125_long_horizon_consensus.py`、`log/analysis/m125_long_horizon_consensus.json`。
+
+## M126：M125 的固定跨域验证映射（仅 1e-5 级增益，不作为主线）
+
+M126 不从公开验证标签选择任何参数。对于未知验证视频，固定训练全部 20 个可能的三折 pair-excluded 头，
+每头只使用自己的训练折目标组件最大概率阈值；只有 20/20 都同意才删除。删除 mask 完成后才读取验证标签计分。
+
+验证集只触发 1 个组件，且事后确认为纯背景：`Score 0.9638562171 -> 0.9638674779`
+（`+0.0000112608`），Pd/Acc 不变、IoU `+0.0000138879`、Fa `-2.9627e-09`。这验证长期背景信号在域外没有
+反向伤害，但交集过严且绝对收益只有 `1e-5`；它仍略低于 M111 的 `0.9638681055`，不会更新 README、checkpoint
+或 Git。由此停止继续扫描组件分类器、阈值、投票数或 margin；冻结 P41 输出上的组件删除只能保留为隐藏测试
+微小候选，不能承担冲击 0.97 的主提升。实现与结果：
+`log/analysis/eval_m126_long_horizon_consensus_validation.py`、
+`log/analysis/m126_long_horizon_consensus_validation.json`。
+
+## M127：正式生产路径的漏检归因（停止后处理扫描）
+
+M127 对正式 `M10/M26 + P41 + P6 + P0/P0c + P18-global` 的 24 个验证视频做逐目标时间窗归因，
+只用于决定后续研究优先级，不改变任何推理输出。4,762 个目标窗中仍漏检 102 个：60 个原始分数已低于
+P18 候选下限、16 个虽在 P18 候选带但未能安全恢复、26 个原始过阈值却被 P0/P18 拒绝。
+
+高密度 M26 路由的 2,551 个目标窗仍有 60 个漏检，其中 36 个低于 P18 下限；低密度 M10 路由的 42 个
+漏检中也有 24 个低于候选下限。漏检目标的运动速度中位数为 `4.31 px/bin`，而已检测目标仅为
+`1.95 px/bin`。因此当前主误差是高速、小尺度目标的原始 event logits 不足，继续扫 P18 下限、P0/P0c、
+组件删除、投票数或阈值只能触及少数 26 个后处理拒绝窗，并会迅速引入背景组件；这条后处理路线停止。
+
+完整结果：`log/analysis/analyze_m127_production_error_anatomy.py`、
+`log/analysis/m127_production_error_anatomy.json`。
+
+## M128：M123 velocity head 的轨迹传播可行性检查（否决）
+
+M128 在 M123 outer=0 的未知视频折上，不改变 checkpoint 和最终 mask，仅将 objectness velocity head
+的预测位移与相邻标注质心位移作事后诊断。1,764 对运动中，预测位移误差是零速度基线的 `1.022x`，
+方向为正的比例仅 `53.2%`，预测速度与真实速度相关性为 `-0.138`；三项均未达到预注册的
+`<0.85x / >=60% / >=0.2` 门槛。
+
+这说明 M123 的 velocity auxiliary 在当前监督和分辨率下不足以可靠估计实际位移。不要以它实现轨迹传播、
+warp、速度门控或将其作为 P18 的连接依据；M123 唯一仍有待验证的有效信号是 objectness-gated event
+residual 本身。完整结果：`log/analysis/analyze_m128_objectness_velocity_outer.py`、
+`log/analysis/m128_objectness_velocity_outer0.json`。
+
+## M129：M123 增益因果消融（objectness 推理门否决）
+
+M129 在 M123 已冻结的 outer=0、epoch 8 checkpoint 上做参数和输入因果消融，不重新训练、不选择阈值。
+正常 M123 相对正式 outer 基线为 `Score +0.00153217`；关闭 objectness event gate 后指标逐位不变，切断
+centre probability 输入后也逐位不变；只有把全部共享主干恢复成原始 M26 参数时，增益才精确归零。
+
+这证明 M123 的 outer 增益不是 objectness event residual 带来的，而是训练期间对共享参数的微调。原计划
+“冻结全部 M26、只训练 objectness residual”的 M129-lite 因此在训练前直接否决，不能继续把 M123 描述为
+objectness 推理门方案。结果：`log/analysis/analyze_m129_m123_causality.py`、
+`log/analysis/m129_m123_causality_outer0.json`。
+
+## M130：M123 共享参数组回退定位（flow_head 为必要部分）
+
+M130 继续在同一 outer 哨兵上按参数组恢复 M26。关闭 gate 的 M123 为 `Score +0.00153217`；恢复全部 base
+后仍为 `+0.00137179`，恢复 recurrent+attention 后仍为 `+0.00126369`，但恢复全部 temporal 后只剩
+`+0.00040198`。单独恢复 `flow_head` 不仅消除增益，还变为 `Score -0.00019255`、
+`Pd -0.00140449`。
+
+因此 `flow_head` 更新是已观察增益的必要组成部分，ConvGRU/attention 不是主来源。这个结论不推翻 M128：
+velocity head 不能可靠预测位移；有效的是 flow_head 对主网络时序对齐/表示的影响，而不是把 velocity 输出直接
+拿来传播轨迹。结果：`log/analysis/analyze_m130_m123_shared_groups.py`、
+`log/analysis/m130_m123_shared_groups_outer0.json`。
+
+## M131：M123 参数组充分性定位（7 个 flow tensor 保留大部分增益）
+
+M131 从原始 M26 checkpoint 出发，只拷贝 M123 的指定参数组，再关闭 objectness gate 评分。只拷贝 7 个
+`flow_head` tensor 已得到 `Score +0.00116839`、`Pd +0.00084270`、`IoU +0.00212288`、
+`Fa -1.46264e-7`；只拷贝 recurrent+attention 为 `Score -0.00010737`；拷贝全部 temporal 为
+`Score +0.00137179`。
+
+这是比 M123 架构叙事更可靠的机制证据：outer=0 上约 76% 的 M123 增益可由 flow_head 单独解释，而且同时改善
+Pd、IoU 和 Fa。它仍是同一 outer 折上的事后定位，不能视为泛化证明；下一步只允许在全新 outer=2 上验证，
+不得据此看公开验证集或扫描超参。结果：`log/analysis/analyze_m131_m123_temporal_sufficiency.py`、
+`log/analysis/m131_m123_temporal_sufficiency_outer0.json`。
+
+## M132：对象级多任务约束的 flow-only 微调（outer=2 否决）
+
+M132 根据 M129--M131 的因果证据缩小训练自由度：从原始 M26 初始化，只允许 7 个 `flow_head` tensor 和
+三个训练期 objectness 辅助头更新；M26 base、ConvGRU、memory projection、attention 以及零初始化的
+objectness event gate 全部冻结。训练仍保留 event BCE、teacher SmoothL1、正事件保持、centre/presence/
+velocity 对象级辅助、advection consistency 与 target-flow 监督；velocity 和 objectness heads 只提供训练
+约束，推理不读取它们的输出。
+
+真实单 sequence 冒烟耗时 `2.26 s/sequence`、15 个 flow pair、loss 有限。probe checkpoint 审计确认：
+96 个与 M26 共享 tensor 中只有 7 个 `flow_head` tensor 改变，其余 89 个逐元素一致，event gate 最终投影
+严格为零，训练折严格为 `2,3,4`。另已让 `TRAIN.scheduler_t_max` 生效；正式 8 epoch 哨兵设为 `T_max=12`，
+从而复现 M123 前 8 轮的 cosine 学习率轨迹，而不浪费后 4 轮。
+
+随后按预注册协议完成了唯一一次独立哨兵：outer=2、calibration=3、训练 folds `0,1,4`、seed 132，
+评估 epoch `2,4,6,8`。calibration 选中 epoch 2（`Score +0.00010084`），但未参与训练的 outer=2
+只有：`Score +0.00008010`、`Pd +0.00000000`、`IoU +0.00097919`、`Acc -0.00003511`、
+`Fa +4.27952e-8`；teacher 正事件保持率为 `100%`。outer Score 增量低于预注册的 `+0.0010`，因此
+M132 **否决**。
+
+这次结果说明 flow-only 更新在第二个折上确实有轻微、方向一致的 IoU 改善，但没有增加召回，且虚警略升，
+不能转化为足够的比赛分数。按停止规则不补到 12 epoch、不换 seed、不扫 loss/epoch、不做五折 OOF，
+也不读取公开验证集。checkpoint 结构审计通过：仅 7 个 `flow_head` tensor 改变，其余 89 个共享 tensor
+不变，event gate 输出严格为零。评估结果：`log/analysis/m132_flow_only_outer2.json`；训练目录：
+`log/m132_flow_only_outer2_seed132/runs/20260820-215028_seed132_pid549/`。执行协议：
+`docs/M132_FLOW_ONLY_EXECUTION.md`。实现与回归：`tests/test_m132_objectness_flow_only.py`、
+`log/analysis/audit_m132_flow_only_checkpoint.py`、`log/analysis/m132_flow_only_probe_audit.json`。
+
+M132 的最终结论：outer=0 的 `+0.001168` flow 证据没有在独立 outer=2 复制，后续不得再把 flow-only
+训练作为提分主线；正式最佳和生产路径保持不变。
+
+## M133：冻结 M123 epoch 8 的一次性公开验证（否决）
+
+M123 epoch 8 已由 train calibration fold 1 选定，并在未参与训练和选择的 outer fold 0 达到
+`Score +0.00153217`，因此将 checkpoint、`gate_strength=0.25` 和正式 P41/P6/P0/P0c/P18-global
+策略全部冻结后，在 24 个公开验证视频上只评一次。验证标签不参与 checkpoint、gate、阈值或后处理选择；
+低密度视频仍固定走 M10，高密度视频才使用 M123。
+
+| 配置 | IoU | Acc | Pd | Fa | Score |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 正式 M10/M26 基线 | 0.9423022866 | 0.9763227701 | 0.9785804284 | 4.6632902944e-06 | **0.9638562171** |
+| M10/M123 epoch 8 | 0.9421118498 | 0.9758953452 | 0.9766904662 | 4.6218124900e-06 | 0.9631381909 |
+| 增量 | -0.0001904368 | -0.0004274249 | **-0.0018899622** | -4.14778044e-08 | **-0.0007180262** |
+
+M123 略微降低 Fa，使 `Score_Fa +0.00039595`，但同时损失约 `0.00189` Pd，最终 Score 明显下降。
+这与 M132 在新 outer=2 只有 `+0.00008010` 的结果共同说明：M123 的 outer=0 提升是折特异的，不能
+泛化到当前公开验证。完整 M123 联合训练实测约 45 分钟/epoch；原本考虑的第二个 8-epoch outer 哨兵约需
+6 小时，而 M130 消融显示 flow 之外的共享更新在 outer=0 仅额外贡献约 `+0.00036`，已不足以证明这项投入
+值得，因此 **M133 长训练在启动前取消**。不跑第二折、不补 epoch、不扫 gate/阈值，也不更新 README、
+正式 checkpoint 或 Git。
+
+结果：`log/analysis/m133_m123_validation_epoch8.json`。用于生成固定 gate 元数据副本的脚本为
+`log/analysis/materialize_m123_gate_checkpoint.py`；临时副本只存在于 `/tmp`，模型 tensor 未改变。
+
+## M134：配对反事实训练与选择性比赛指标任务向量（outer=4 弱正增益，按门槛否决）
+
+M133 后重新核对了 M1--M133、M127 误差归因以及队友仓库的历史任务向量和高密度专家证据。下一步只保留
+`M26 + (teacher-selective treatment - paired control)` 这一条短哨兵主线：用严格配对相减消除普通续训漂移，
+新增监督只针对冻结 M26 teacher 未覆盖的目标时间窗、teacher 已覆盖目标窗的单向保持，以及 teacher 高分
+纯背景时空 cell。候选仍为原 M26 架构，推理不读取标签、target ID 或视频名，正式 P41/P6/P0/P18 不变。
+
+第一哨兵固定为 `fit folds 1,2,3 -> outer fold 4`、三轮、epoch 3、alpha 1；只有 outer `Score delta >=
++0.0010` 且 Pd/IoU/Fa 方向同时正确才继续第二折，禁止扫权重、epoch、alpha 或阈值。完整机制、实现检查、
+配对审计、WSL 命令模板和停止条件见 `docs/NEXT_SCORE_PLAN_AFTER_M133.md`。本节记录了从训练前诊断到
+outer=4 哨兵的完整结果；M134 未成为新正式方案。
+
+### 训练前固定 teacher 覆盖诊断
+
+在不读取 outer=4 标签、不反向传播、不写 checkpoint 的前提下，固定使用 M134 的 `fit folds=1,2,3`、
+seed `134`、epoch-1 的 192 个注册训练 sequence 和冻结 M26 teacher，对实际将进入 treatment 的选择性损失
+做了一次全量前向诊断。结果保存在 `log/analysis/m134_outer4_teacher_diagnostic.json`：
+
+| 项目 | 结果 |
+| --- | ---: |
+| 训练视频 / 超高密度视频 | 33 / 9 |
+| 注册 sequence | 192 |
+| 目标窗 group | 4,702 |
+| teacher 未覆盖 group | 193 |
+| 含正 recall loss 的 sequence | 56 |
+| 候选纯背景 cell / 选中 hard cell | 999,188 / 10,098 |
+| 含正背景损失的 sequence | 165 |
+
+该诊断通过了“新增损失确实命中目标”的必要门槛：召回和背景两项均不是零触发，因此允许进入**唯一一次**
+outer=4 配对三轮哨兵。它不代表任何 Score 增益，也不允许据此修改权重、cell 比例、epoch 或阈值；正式训练
+完成后仍必须先通过 pair audit、再以固定 M10/M26+P41+P6+P0/P0c+P18-global 生产链评分。
+
+### M134 首次配对训练：审计否决，未读取 outer=4 标签
+
+首次 control 与 treatment 均按注册的 `fit folds=1,2,3`、seed 134、3 epoch、192 sequence/epoch 完成：
+
+```text
+control   = log/m134_control_outer4_seed134/runs/20260821-105639_seed134_pid6788/
+treatment = log/m134_selective_outer4_seed134/runs/20260821-111547_seed134_pid6849/
+```
+
+resolved config 只有输出目录和 `teacher_selective_metric_enabled` 不同；训练视频、采样、父 checkpoint、fold
+manifest、CPU/CUDA/Python/NumPy RNG 摘要均一致，treatment 在 epoch 2/3 的新增损失也按预期命中。然而应完全
+无干预的 epoch 1 末，两次独立 CUDA 进程的 `flow_head.first.0.weight` 最大绝对差为 `1.66380778e-06`，超过
+注册的 `atol=1e-7, rtol=1e-5` 数值身份门槛。该首轮漂移总 L2 为 `1.1165e-05`，仅约为最终
+`treatment-control` 任务向量 L2 `2.4477e-02` 的 `0.046%`，但不能据此事后放宽门槛。
+
+因此本次 checkpoint **不合成、不评分、不读取 outer=4 标签**；它只能证明损失实现和命中范围正常，不能给出
+M134 的分数结论。
+
+### M134R：精确 control warmup anchor 续训（outer=4 否决）
+
+为保留已完成的 control，同时消除无干预期的跨进程数值漂移，M134R 不改变任何科学超参数，而是让 treatment
+从 control 的 `epoch_001_seed134.pt` 和对应 optimizer/scheduler sidecar 精确恢复，再仅运行零基 epoch 1、2
+（即剩余两轮选择性训练）。恢复前会逐位核对 model、optimizer、scheduler 的稳定 SHA；短 GPU probe 已通过，
+锚点回执为 `log/m134_resume_probe_outer4_seed134/.../m134_resume_anchor_audit.json`。
+
+M134R treatment 已完成于：
+
+```text
+log/m134_selective_outer4_resumed_seed134/runs/20260821-195822_seed134_pid563/
+```
+
+续训链审计通过：control epoch 1 的 model、optimizer、scheduler 和 Python/NumPy/CPU/CUDA RNG 摘要均与
+恢复锚点一致；33 个训练视频、9 个超高密度视频和每轮 192 个 sequence 也全部符合注册协议。treatment 在
+epoch 2/3 均实际触发新增监督：
+
+| epoch | missed / covered target group | hard background cell | recall / preserve / background loss |
+| --- | ---: | ---: | ---: |
+| 2 | 193 / 4,509 | 10,098 | 2.9846 / 0.00263 / 2.2559 |
+| 3 | 186 / 4,482 | 10,028 | 2.8923 / 0.00604 / 2.2597 |
+
+候选严格按 `M26 + (treatment - control)` 合成，三个浮点输入先转为 `float64` 后再相减；alpha=0 身份、
+alpha=1 重算、非浮点 buffer 和 strict-load 均通过。候选为
+`log/analysis/m134_outer4_resumed_candidate_seed134.pt`，SHA-256 为
+`1c7106a87896d11d09b2060d77effd573d231c1564f65d1c02d610090343ec2c`，task-vector L2 为 `0.02447730`。
+
+固定候选后才读取 outer=4 标签，仍使用完整生产链 M10/M26+P41+P6+P0/P0c+P18-global：
+
+| outer=4 | Score | Pd | IoU | Acc | Fa |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| baseline | 0.92170652 | 0.96961907 | 0.86967993 | 0.96945596 | 1.31714724e-05 |
+| M134R | 0.92250855 | 0.97055387 | 0.87037873 | 0.96985626 | 1.30770909e-05 |
+| delta | **+0.00080203** | +0.00093480 | +0.00069880 | +0.00040030 | -9.43815700e-08 |
+
+正确目标窗从 `4,154` 增至 `4,158`，FP event 从 `6,592` 降至 `6,567`。但 4 个新增正确窗都集中在
+`train_088.npz`，而 FP 改善主要来自 `train_096.npz` 和 `train_097.npz`，缺少跨视频一致性证据。
+
+虽然 Pd、IoU、Acc、Fa 的方向全部正确，Score 增量仍低于预注册的 `+0.0010`，因此 M134R **按停止规则否决**。
+不进行第二个 outer 折、五折 OOF、全训练集部署训练，也不扫 alpha、loss 权重、epoch、seed、阈值或后处理；
+不更新 README、正式 checkpoint、提交 TXT 或 Git 发布内容。该结果只能作为“配对选择性任务向量存在弱正信号”的
+机制证据，不能视为可泛化的提分方案。
+
+### M134R：用户授权的 outer=3 冻结确认（已完成，否决）
+
+outer=4 的 `Score +0.00080203` 不是正式方案门槛的通过结果，但它是近期少数同时改善 Score、Pd、IoU 和 Fa 的
+严格留出证据。用户据此授权一次**不改变任何 M134 科学参数**的独立确认，而不是围绕该折扫 alpha、loss 权重、
+epoch、阈值或后处理。
+
+确认固定为 `fit folds=0,1,2 -> outer=3`、`reserved fold=4`、seed `135`、epoch 3、alpha 1。训练折包含
+32 个 M26 路由视频和 9 个超高密度视频，因此每轮必须为 190 个 sequence。control 先完整训练 3 轮；treatment
+只从 control epoch 1 的精确 model/optimizer/scheduler/RNG 锚点恢复并续训余下 2 轮。外层标签仍须等候 pair audit
+和 float64 合成完成后才读取。
+
+本次的唯一判定目标是复现正方向：outer=3 若 Score `<=0`，或 Pd/IoU/Fa、正确目标窗或 FP event 任一方向变差，
+M134 永久停止；若 outer=3 继续正向，则根据两折平均 Score 是否达到 `+0.0005` 决定是否值得讨论一次全数据部署训练。
+无论结果如何，README、正式 checkpoint 和提交文件在公开验证一次性评估前不更新。
+
+outer=3 的 control 与 treatment 已完成，且 pair audit 通过。control 使用：
+
+```text
+log/m134_control_outer3_seed135/runs/20260821-220821_seed135_pid1232/epoch_003_seed135.pt
+```
+
+treatment 使用固定协议要求的 `epoch_003`（不是 `best_loss`）：
+
+```text
+log/m134_selective_outer3_resumed_seed135/runs/20260821-230738_seed135_pid1386/epoch_003_seed135.pt
+```
+
+epoch-1 的 model、optimizer、scheduler 与 RNG 恢复锚点完全一致；32 个训练视频、9 个超高密度视频、每轮
+190 个 sequence 均通过审计。候选严格按 `M26 + (treatment - control)` 合成，浮点 tensor 先分别转为
+`float64` 再相减：
+
+```text
+candidate: log/analysis/m134_outer3_resumed_candidate_seed135.pt
+candidate SHA-256: 1de922d8a8abbb118aaa3690c401161b3663ac9ba2afc98cf45a9f809cd71254
+task-vector L2: 2.43840107e-02
+pair audit: log/analysis/m134_outer3_resumed_pair_audit.json (PASS)
+score: log/analysis/m134_outer3_resumed_score.json
+```
+
+treatment 的新增监督确实触发：epoch 2 为 `279 / 4,245`（missed / covered）目标 group、11,707 个 hard
+background cell；epoch 3 为 `278 / 4,280`、11,696 个 hard background cell。固定候选后在 outer=3 读取标签并
+使用同一生产推理链，结果如下：
+
+| outer=3 | Score | Pd | IoU | Acc | Fa |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| baseline | 0.94181208 | 0.97434087 | 0.91177356 | 0.98043042 | 9.91650297e-06 |
+| M134R | 0.94185580 | 0.97457627 | 0.91184133 | 0.98065048 | 9.94816262e-06 |
+| delta | +0.00004372 | +0.00023540 | +0.00006777 | +0.00022006 | **+3.16596406e-08** |
+
+正确目标窗为 `4,144 -> 4,145`，但 FP event 为 `5,133 -> 5,144`；Fa 和 FP event 同时上升。虽然 Score、Pd、
+IoU、Acc 有极小正变化，已触发“任一方向变差即停止”的预注册规则。结合 outer=4 的 `Score +0.00080203`，
+两折平均 Score 增量仅为 `+0.00042288`，也低于继续部署所需的 `+0.0005`。因此 M134/M134R **永久停止**：
+不再补 epoch、换 seed、扫 alpha 或 loss 权重，不进行五折 OOF、全量 pair training、阈值/后处理搜索，也不更新
+README、正式 checkpoint、提交 TXT 或 Git。该方向只保留为“严格配对任务向量有弱正信号，但不能稳定控制虚警”的失败经验。
+
+### M134R：完整验证集复核（全量否决）
+
+为回答“outer 折局部增益是否能转化为正式最高分”，使用与当前 M26 最高分完全相同的 `test2.py` 生产链，
+只将主模型替换为 outer=4 的合成候选；M10 辅助模型、P41、P0/P0c、P18-global、P6 和阈值全部保持不变。
+验证集为 24 个视频，未修改候选权重或后处理参数。
+
+| 全量验证 | IoU | Acc | Pd | Fa | Score |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M26 baseline | 0.9423022866 | 0.9763227701 | 0.9785804284 | 4.6632902944e-06 | 0.9638562171 |
+| M134R outer=4 candidate | 0.9420830011 | 0.9761243463 | 0.9781604368 | 4.6603275941e-06 | 0.9636330042 |
+| delta | -0.0002192855 | -0.0001984238 | -0.0004199916 | -2.9627003e-09 | **-0.0002232129** |
+
+因此 outer=4 的 `+0.00080203` 只适用于该留出折，不能加到正式最高分上；在完整验证集上 M134R 实际降分。
+以后所有方向的唯一提分判定为：在固定完整 `test2.py` 生产链上，最终 `Score` 必须严格高于
+`0.9638562171`，局部 outer 折的正增量只能作为候选筛选信号，不能作为成功结论。M134R 不进入正式方案。
+
+## M124：M115 细组件 + 长期背景重复率 verifier（当前最高分候选）
+
+M111 的三 seed 相位专家平均只比正式 P41 高 `0.0000118884`，没有达到继续训练的价值门槛。随后把
+M115 的最终 50-bin 组件几何/分数特征与 M124 的整段视频长期像素活动特征组合成一个**纯背景组件 verifier**。
+训练只读取 99 个训练视频的冻结 P41 分数缓存和标签；推理时只读取当前整段视频的事件坐标、时间和模型
+分数，不读取视频名、target id 或测试标签。verifier 只在既有 P0/P0c/P18 后、最终阈值化前删除组件，
+不会改变主网络、P41、P6 或 P18 参数。
+
+固定模型为 ExtraTrees `n_estimators=300, min_samples_leaf=3, max_features=sqrt, class_weight=balanced,
+random_state=1240`，背景概率阈值固定为 `0.90`。训练矩阵为 `53305 x 45`，其中 14,195 个纯背景组件和
+39,110 个含目标组件。生产 artifact 为：
+
+```text
+checkpoints/m124_m115_long_background_verifier_v1.pkl.gz
+SHA-256: B39A2DD93A2B6B499F558338FCFEE3B7BD20F8CECCFB66499549617E832D1C8B
+```
+
+`utils/component_background_verifier.py` 中的特征提取与原诊断逐元素核对，矩阵最大绝对误差为 `0`。
+`test2.py` 和 `submit_challenge2.py` 均加入了同一个配置开关，默认关闭；开启时必须使用逐视频完整流推理：
+
+```text
+POSTPROCESS.m124_background_verifier_enabled=true
+POSTPROCESS.m124_background_verifier_model_path=$PROJECT_DIR/checkpoints/m124_m115_long_background_verifier_v1.pkl.gz
+POSTPROCESS.m124_background_verifier_threshold=0.90
+```
+
+完整 24 视频验证严格使用 M111（M26 + M10 低密度路由、P41、P6、P0/P0c、P18-global）生产链，关闭和开启
+verifier 的回归结果如下：
+
+| 配置 | IoU | Acc | Pd | Fa | Score |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M111（verifier 关闭） | 0.9422997832 | 0.9762769938 | 0.9785804284 | 4.6573648938e-06 | 0.9638681055 |
+| M111 + M124 verifier | **0.9425080419** | 0.9762769938 | 0.9785804284 | **4.6129243890e-06** | **0.9640370402** |
+| 相对正式 M26/P41 基线 | +0.0002057553 | -0.0000457763 | 0 | -5.0365905e-08 | **+0.0001808231** |
+
+开启后 24 个视频共删除 15 个组件，标签审计显示 15 个均为纯背景、没有删除目标组件。该结果是目前第一
+个在完整公开验证集上超过正式最高分 `0.9638562171` 且达到 `+0.0001` 门槛的候选；提交前仍需用同一
+配置运行 `submit_challenge2.py`，不要把 M124 阈值或组件删除改成逐视频标签调优。
+
+已用同一配置运行 `submit_challenge2.py` 生成 24 个验证 TXT，并从 TXT 独立回算得到完全相同的
+`Score=0.9640370402`，输出目录为 `log/analysis/m124_submission_val/`。因此 `test2.py` 与提交路径的
+verifier 插入位置和阈值化顺序一致。
+
+### OOF 风险审计与定位
+
+为确认固定 `0.90` 不是仅依赖公开验证集的阈值，额外在 99 个训练视频上进行视频级五折 OOF：每个外折
+只用其余四折训练同一 ExtraTrees，然后对外折做固定 `0.90` 删除。五折 Score 都为正，合并 OOF
+`Score +0.0084388972`、`IoU +0.0176366568`、`Fa -2.1712775e-06`，但删除 3,283 个组件中的 243 个
+含目标组件，`Pd -0.0021215709`。阈值升至 `0.97` 才不降低 OOF Pd，但在公开验证缓存中不会删除任何组件；
+`0.91` 在公开验证仍有 `+0.0001351467`，但 OOF 仍删除 196 个含目标组件。结果：
+`log/analysis/m124_fixed_threshold_oof.json`。
+
+因此当前 `0.9640370402` 满足“完整公开验证至少 `+0.0001`”的提交候选门槛，但不能被描述为已证明的
+普适方案。下一步只值得验证一个更高精度的 M115+M124 跨折一致性模型：必须先在五折 OOF 达到零目标组件
+删除、Pd 不降、至少四折非负和 Score `+0.001`，才允许映射到公开验证或接入提交路径；禁止继续扫描单模型
+阈值 `0.90--0.99`。
+
+## M135：M115 细组件 + M124 长期特征跨折共识（否决）
+
+M135 按预注册协议只做了一次 99 个训练视频的五折 OOF，不读取公开验证标签，也不接入生产推理。它保留
+M125 的四个 pair-excluded ExtraTrees 头、每个校准折目标组件最大背景概率加 `1e-6` 的安全阈值，以及四头
+全部同意才删除的规则；唯一科学变化是把 M115 的 35 个最终细组件特征与 M124 的 10 个长期重复活动特征
+拼成 45 维输入。代码和固定报告为 `log/analysis/analyze_m135_combined_consensus.py`、
+`log/analysis/m135_combined_consensus_oof.json`。
+
+| 指标 | M125 长期特征 | M135 组合特征 |
+| --- | ---: | ---: |
+| OOF Score 增量 | `+0.0009948016` | `+0.0006888292` |
+| Pd 增量 | `0` | `0` |
+| IoU 增量 | `+0.0019274950` | `+0.0008776188` |
+| Fa 增量 | `-2.2738519e-07` | `-1.9295463e-07` |
+| 删除组件 | 319 | 281 |
+| 删除纯背景组件 | 319 | 273 |
+| 删除含目标组件 | **0** | **8** |
+| Score 非负 outer 折 | 5/5 | 5/5 |
+
+M135 的 OOF Score 低于预设 `+0.0010` 门槛约 `0.0003112`，且在 outer=4 误删 8 个含目标组件；因此即使
+Pd 的 pooled 数值没有下降，也已经违反零目标删除门槛。加入 M115 特征没有提供额外可迁移信息，反而破坏了
+M125 的安全性。按协议不进行验证集映射、不改变四头共识票数、不扫阈值/特征子集、不训练新模型。
+
+本轮之后，M125/M135 这条“纯背景组件 verifier 的跨折共识”路线视为耗尽。当前完整公开验证最高分仍为
+`M111 + M124 = 0.9640370402`；M135 没有产生新的 checkpoint、提交文件或正式方案。
+
+## M136：长期极性重复特征的最终组件共识筛查（否决）
+
+M136 只做一次训练集 99 视频的只读 OOF 诊断，目的是确认 M115/M124/M135 没有使用的原始事件极性长期
+重复模式，能否消除 M135 的尾部误删。它不读公开验证标签、不修改 `test2.py`、checkpoint 或生产后处理。
+每个缓存事件都与对应训练 `.npz` 的原始 `ev_loc` 逐位核对，之后在 M135 的固定 45 维特征上追加六个预先
+固定的特征：组件内极性不平衡、像素长期极性不平衡的均值/p90、活跃时间箱的主极性占比、组件事件与像素
+主极性的匹配率、以及 3x3 邻域长期极性不平衡。推理规则仍严格复用 M135：每个 outer 折的四个
+pair-excluded ExtraTrees 分别以各自 calibration 折的目标组件最大概率加 `1e-6` 为阈值，只有四头全部
+同意才删除。代码和报告为 `log/analysis/analyze_m136_polarity_recurrence.py`、
+`log/analysis/m136_polarity_recurrence_oof.json`。
+
+三个特征存在方向稳定但中等的训练视频信号：组件内极性不平衡 `AUC=0.630`、像素极性不平衡 p90
+`AUC=0.655`、邻域长期极性不平衡 `AUC=0.590`；前两者五折方向一致率均为 `1.0`。但这并没有形成可安全
+迁移的纯背景尾部：
+
+| 指标 | M135 | M136 极性扩展 |
+| --- | ---: | ---: |
+| OOF Score 增量 | `+0.0006888292` | `+0.0007635860` |
+| Pd 增量 | `0` | `0` |
+| IoU 增量 | `+0.0008776188` | `+0.0009334683` |
+| Fa 增量 | `-1.9295463e-07` | `-2.1734295e-07` |
+| 删除纯背景组件 | 273 | 307 |
+| 删除含目标组件 | 8 | **10** |
+| Score 非负 outer 折 | 5/5 | 5/5 |
+
+全部 10 个含目标误删仍集中在 outer=4。虽然池化 OOF Score 略高于 M135，但它既未达到 `+0.0010` 门槛，
+也更严重地违反零目标组件删除条件；这个训练 OOF 增量不能加到公开验证 `0.9640370402` 上。结论：不映射
+验证集、不改阈值、投票数、特征子集或分类器参数，也不训练极性 verifier。至此，最终组件删除路线连同
+几何/分数、长期计数、RVT 特征和原始极性重复特征均已完成严格筛查，应转向主模型训练目标或新的外部表征。
+
+## M137：官方目标时间窗均衡正样本 BCE（完整验证否决）
+
+M137 试图直接处理当前 M26 路由中的残余漏检：官方 Pd 按 `(target_id, 50-unit time bin)` 给每个目标时间窗
+同等价值，而常规 `frame_balanced_event_bce` 在一个 16-bin 训练视图内按事件级正样本质量分配梯度。训练前只读
+99 个训练视频冻结 P41 缓存的审计显示，296 个 M26 原始低分目标窗的中位事件数为 3，而已检出窗为 10；若改为
+每个目标时间窗等权，低分窗的相对正样本梯度质量中位提升为 `2.263605x`，五个训练 outer 折方向全部一致。
+该审计通过了预设准入，但它只证明训练目标与误差形态相关，不能代替完整分数验证。
+
+实现保持推理完全不变，只在 `train_temporal_memory.py` 的训练阶段增加默认关闭的
+`temporal_memory_target_frame_balanced_*` 配置。数据集额外传递原始事件时间戳，而不是错误地使用采样序列内的
+`0..15` 局部索引；因此辅助损失严格按真实 50-unit 官方时间窗分组，并排除时间恰好落在 50-unit 边界上的事件。
+对 logits 使用稳定的 `softplus(-logit)` 正样本 BCE，先在一个目标窗内平均事件损失，再在目标窗之间平均。
+单元测试验证了两种关键性质：同一窗内 2 个事件与另一窗内 1 个事件获得相同总梯度质量；原始时间 `50` 的边界
+事件不参与，而 `51` 正常参与。真实 GPU 冒烟也确认辅助项有限、非零且可反向传播。
+
+唯一正式哨兵从 `checkpoints/m26_targetflow_m20e3_epoch_003_seed53.pt` 初始化，固定 M26 的高密度训练路由、
+8x dense view、学习率、attention、bounded advection 和 target-flow 监督，只训练 1 epoch：
+
+```text
+enabled=true
+weight=0.01
+warmup_epochs=0
+temporal_bin_size=50
+seed=137
+```
+
+训练目录为
+`log/m137_target_frame_balanced_m26e3_dense8_e1_seed137/runs/20260822-104714_seed137_pid8801/`。本轮完成
+318 个 sequence，辅助损失累计覆盖 7,714 个目标时间窗（每 batch 平均 `24.2579`），所有 checkpoint metadata
+都记录了开关、权重和时间窗大小。候选 `epoch_001_seed137.pt` 的 SHA-256 为
+`B2F1957E1F0F4151F3BE7244CE14FDC3C3D1C9AE587D85D8E22198240585D32E`。
+
+随后只运行一次完整 24 视频生产评估：低密度 M10 路由、M137 替换高密度 M26、M111 phase specialist、P41、
+P6、P0/P0c、P18-global 与 M124 verifier 均保持 README 当前最高候选的固定设置。没有扫描 checkpoint、权重、
+epoch、阈值或后处理。
+
+| 配置 | IoU | Acc | Pd | Fa | Score |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 当前最高 M111 + M124 | 0.9425080419 | 0.9762769938 | 0.9785804284 | 4.6129243890e-06 | **0.9640370402** |
+| M137 epoch 1 + 同一生产链 | 0.9423547387 | 0.9760174751 | 0.9766904662 | 4.5921854868e-06 | **0.9632838608** |
+| 增量 | -0.0001533032 | -0.0002595187 | **-0.0018899622** | -2.07389022e-08 | **-0.0007531794** |
+
+M137 虽然略微降低 Fa，但它把本应恢复的目标时间窗梯度扩展到更多低支持度正事件，最终在完整生产链中造成 Pd
+下降，远未达到至少超过当前最高分 `+0.0001` 的准入要求。结论：**M137 永久停止**；不补第 2/3 epoch，
+不调辅助 loss 权重、warmup、seed、阈值或后处理，也不更新 README、正式 checkpoint、提交 TXT 或 Git。训练
+前的“低分窗更小”只可作为误差归因事实保留，不能再被用作重复测试同类正样本重加权的理由。完整输出：
+`log/analysis/m137_target_frame_balanced_full_validation.log`；训练前审计：
+`log/analysis/m137_target_frame_balance_audit.json`。
+
+## M138：冻结 RVT H/4 轻量候选空间预检（停止）
+
+M138 不训练主模型，也不读取公开验证标签。它先只问一个必要条件：若把每个 50-unit 时间 bin 中
+event-occupied 的 RVT H/4 cell 作为潜在 proposal，是否能用一个受限、无标签的候选规则覆盖当前生产链的
+残余漏检？候选规则在读取训练标签前固定为：cell 内 P41 最大事件分数 `>=0.20`、至少 1 个事件、每视频最多
+按分数保留 1,024 个 cell；并以 cell ID 作为确定性并列排序。
+
+99 个训练视频上重放固定 P41+P0/P0c/P18 生产链后，训练残余漏检目标窗为 738 个，候选仅覆盖 381 个
+（`51.63%`），低于预注册的 `85%` 总覆盖和每折 `70%` 覆盖门槛。每视频候选数中位数已经达到 1,024，说明
+失败主要不是 `0.20` 分数下限，而是高密度视频的 top-k 截断；继续提取 RVT 特征或训练 proposal head 无法恢复
+候选空间外的漏检，因此 M138 轻量候选版本停止。
+
+仅为判断是否值得研究更宽的表征诊断，额外做了一次不训练的候选容量统计。若保持 top-k 上限为 4,096，即使
+完全取消分数下限也只能覆盖 `82.38%` 漏检窗；要超过九成覆盖，必须改为不截断、P41 分数 `>=0.10`，其规模为
+平均 5,278 cell/视频、P90 为 13,147、最大 47,012。这不是可以直接接入生产的后处理规则，只允许作为独立的
+M139 冻结表征可分性审计输入。
+
+## M139：宽候选冻结 RVT dense-cell OOF 表征审计（停止）
+
+M139 是与 M138 轻量候选不同的、一次性的可证伪诊断。候选固定为所有 P41 最大分数 `>=0.10` 的
+event-occupied RVT H/4 cell，不使用视频名、目标编号或标签来生成候选。冻结 RVT-Tiny 对完整 99 个训练视频
+提取特征耗时 369.78 秒、峰值显存 32.10 MiB；共缓存 522,549 个 cell（约 938 MiB）。最坏的
+`train_093` 有 47,012 个候选，实测单视频特征提取 5.70 秒，确认资源可行但该候选规模不适合未经验证地接入
+最终推理。
+
+随后只在训练集进行严格的五个循环视频级 OOF：每次 3 折训练、1 折校准、1 折 outer。训练三个同容量的固定
+线性 BCE 头：P41-only（max/mean P41 logit + cell event count）、RVT-only（冻结 RVT 特征 + event count）和
+RVT+P41。所有 head 的 optimizer、epoch（6）、batch size（4,096）、学习率和数据拆分一致；阈值固定为校准折
+所有背景 cell 的最大 logit `+1e-6`，因此没有用 outer 标签调阈值。目标是验证 RVT 是否能为当前漏检 target
+cell 提供超过 P41 的、可安全迁移的独立信号，而不是拟合公开验证分数。
+
+| pooled OOF 指标 | P41-only | RVT-only | RVT+P41 |
+| --- | ---: | ---: | ---: |
+| 漏检 target cell vs 背景 AUC | `0.78183544` | `0.75148316` | `0.78133468` |
+| 视频中位条件 AUC | `0.89260814` | `0.82421328` | `0.86890406` |
+| 零背景校准阈值恢复漏检窗 | `0 / 670` | `0 / 670` | `0 / 670` |
+
+组合模型的 pooled AUC 相对 P41 为 `-0.00050076`，视频中位 AUC 为 `-0.02370408`。虽有四个 outer 折出现
+很小正方向，但 outer=4 的组合 AUC 增量为 `-0.23547331`，表明跨视频迁移不稳定；并且三种头在最保守的
+校准阈值下都没有恢复任一候选可覆盖漏检窗。它未达到预注册的 `AUC +0.03`、视频中位 `+0.02`、至少 4 个正折且
+恢复至少 20 个漏检窗的任何关键联合条件。
+
+因此 **M139 完整停止**：不再调 score floor、top-k、RVT 层、head 容量、epoch、学习率、class weight、阈值、
+融合或逐视频门控；不接入 `test2.py`，不访问公开验证集，不更新 checkpoint、README、提交 TXT 或 Git。它与
+M116--M119 的组件删除失败结论一致：RVT 在部分视频能拟合局部语义，但其高置信尾部和跨视频校准无法安全迁移；
+把它用于新增 target proposal 比用于背景删除更没有稳定余量。
+
+## M140：M26 函数等价 width=24 扩宽（完整验证降分，停止）
+
+M138/M139 已证明 RVT 候选表征不能稳定恢复 M26 残余漏检，因此转向唯一尚未以当前 M26 配方验证的
+结构方向：把已经训练好的 `width=16` M26 扩宽到 `width=24`，但在训练开始前严格保持函数等价。M140
+不使用历史 P42/P47/P49 的 target-centre/centre-memory 结构，也不改变 P41、路由或后处理；新增容量只
+作为可学习的宽度余量。
+
+实现文件为 `log/analysis/inflate_m140_width24.py`。它对 91 个扩展 state tensor 做语义分段复制：旧输出
+行对新增输入通道全部置零，decoder concat、双向 ConvGRU、memory projection、flow head 和 MHA 的
+Q/K/V 三段分别映射；GroupNorm 从 8 组改为 12 组以保持每组通道数，attention 从 4 个 24 维 head
+改为 6 个 24 维 head。`model/temporal_frame_net.py`、`model/temporal_memory_net.py`、
+`utils/temporal_memory_inference.py`、`train_temporal_memory.py` 已加入对应 metadata 和加载支持。
+
+预检报告：`log/analysis/m140_width24_equivalence_report.json`。父权重为
+`checkpoints/m26_targetflow_m20e3_epoch_003_seed53.pt`，SHA-256 为
+`13f7d4d8ab6bdcaaa98f3f906a7d32e687c17454b88b42b94752eec04257f7c4`。CPU/CUDA 随机输入最大绝对差异
+均为 `2.3841858e-6`，真实 `train_000.npz` 的逐事件分数最大差异为 `0`，P0/P0c/P18 后处理掩码完全
+一致。生成的初始化权重为 `checkpoints/m140_width24_equivalent_init_seed140.pt`，SHA-256 为
+`cad286477020072bcd3bf61ee88bd445714bc6a34fefabca39bdef76cb63856f`；它只是初始化 checkpoint，不是
+得分结果。
+
+随后做了训练入口冒烟，确认 width=24、GN=12、6-head checkpoint 能正常加载并开始反向传播；实测宽模型
+在当前 4GB GPU 上约 `19--21 秒/sequence`，完整 M26 dense-8 配方约 408 sequences/epoch，即约
+`2.4 小时/epoch`。之后用户完成了一轮正式训练，并用固定完整 `test2.py` 生产链验证，详见
+`log/analysis/m140_width24_m111_m124_full_verify.log`。结果为 `Score=0.9633752721`，低于当前完整最高
+`0.9640370402`，且 `Pd` 下降 `0.0018899622`。虽然 IoU 与 Fa 略有改善，但总分和召回均未达到准入要求。
+因此 M140 **停止**：不补 epoch、不换 seed、不扫学习率/宽度/后处理，也不更新 README、正式 checkpoint、
+提交 TXT 或 Git。训练 checkpoint 为
+`log/m140_width24_dense8_e1_seed140/runs/20260822-130111_seed140_pid23487/best_loss_seed140.pt`，
+训练摘要的 `best_epoch=0` 仅表示 loss 选择结果，不能作为得分选择依据。评估使用 M140 高密度主模型、M10 低密度
+路由、M111/P41、P6、P0/P0c、P18-global 和 M124 verifier，最终得到：
+
+```text
+IoU       0.9424287677
+Acc       0.9758495688
+Pd        0.9766904662
+Fa        4.5595957834e-06
+Score     0.9633752721
+```
+
+相对当前完整最高 `0.9640370402`，Score 为 `-0.0006617681`，Pd 为 `-0.0018899622`。完整日志为
+`log/analysis/m140_width24_m111_m124_full_verify.log`。为使不同宽度的路由专家能够合法共存，本轮对
+`utils/temporal_memory_inference.py`、`test2.py` 和 `submit_challenge2.py` 做了兼容修复：主模型仍严格使用配置宽度，
+辅助模型在 `width=None` 时从自身 checkpoint metadata 读取宽度。该修复不改变 width-16 模型参数或推理逻辑；基线回归
+仍精确为 `0.9640370402`。
+
+## M125 共识票数变体复核：停止，不接入生产
+
+在 M125 的四头跨折共识实现完成后，只做了一次预先固定的票数变体诊断，目的是确认是否存在比 `4/4` 更实用、
+同时仍能跨视频迁移的安全门控。分类器、特征、pair-excluded 划分、校准阈值和验证映射均未改变：每个头只使用
+训练折拟合，在独立 calibration 折上取目标组件最大背景概率再加 `1e-6` 作为阈值；验证集只在删除掩码固定后计分。
+本轮不使用视频名、target id 或验证标签，也不训练新的主模型。
+
+结果记录在 `log/analysis/m125_consensus_variants.json`，诊断脚本为
+`log/analysis/analyze_m125_consensus_variants.py`：
+
+| 共识规则 | OOF Score 增量 | OOF 误删目标组件 | 验证 Score 增量 |
+| --- | ---: | ---: | ---: |
+| 4/4 | `+0.00099480` | 0 | `+0.00001126` |
+| 3/4 | `+0.00267973` | 1 | `+0.00004489` |
+| 2/4 | `+0.00364218` | 11 | `+0.00004489` |
+| 1/4 | `+0.00424633` | 28 | `+0.00005848` |
+
+公开验证集的 20 个 pair-excluded 头全部参与时只删除了 1 个组件（`+0.00001126`）；放宽为 15/20、10/20 或
+5/20 时均只有 `+0.00004489`，1/20 虽达到 `+0.00005848`，却误删 2 个目标组件。所有变体都低于当前完整公开
+验证最高分 `0.9640370402` 的至少 `+0.0001` 准入门槛。OOF 中较大的增量来自放宽票数，但它同步引入目标误删，
+不能作为最终测试集的无标签普适策略。
+
+因此 M125 共识变体全部停止：不放宽投票、不扫描阈值或特征、不训练更长、不映射验证集，也不修改 `test2.py`、
+README、checkpoint、提交 TXT 或 Git。当前生产候选仍固定为 **M111 + M124，完整公开验证 Score=0.9640370402**；
+在没有新的可靠外部事件表征、额外标注或全新对象级检测结构之前，不再投入 M26 的小改动和组件删除变体。
+
+## M141：真正新表征、额外标注与动态对象级检测路线（规划，未执行）
+
+本轮重新审视了当前 `0.9640370402` 候选与约一百轮历史实验，结论是：继续做 M26 周边的小学习率、换 seed、
+阈值/组件扫描没有足够提分预期。当前生产归因有 4,762 个目标时间窗，其中 102 个漏检；60 个来自 M26 路由，
+漏检目标速度中位数约 `4.31 px/bin`，已检出目标约 `1.95 px/bin`。放宽后处理会快速增加背景，不能作为到 `0.97`
+的主路线。
+
+### 外部预训练表征复核
+
+- M85 MEM：官方 checkpoint HTTP `403`，无法在 EV39 加载；ViT 只有 `14x14` token、等效 stride=16，
+  对当前 346x260 微小目标也存在空间信息不足风险。永久停止，不找镜像、不改 patch、不换环境。
+- M86 E2VID：冻结第一层特征 outer ROC-AUC=`0.8345802269`，低于已有 M75-B control=`0.8376504921`；
+  不解冻、不加深 head、不融合概率。
+- M139 RVT dense-cell：冻结 RVT+P41 的 pooled AUC 比 P41 低 `0.00050076`，零背景校准没有恢复任何漏检窗；
+  不再扫 score floor、top-k、层或阈值。
+
+因此除非用户能提供一个本地、可在 EV39/PyTorch 1.9.1+cu111 strict-load 的新事件预训练 checkpoint，外部表征
+路线暂不投入。用户提供新权重时，必须先做源码、许可证、stride、显存、逐事件映射和两折冻结 AUC 审计，不能直接长训。
+
+### 额外标注路线
+
+当前 99 个训练视频已经包含 `seg_label`、`target_id`、事件时间和坐标，已有 M5/M26/中心/flow/query 监督；工作区
+没有新的标注数据。只有新增“高速困难窗口完整轨迹（中心、尺度、可见性）”“漏检窗口逐事件边界”或“纯背景组件精确边界”
+才会增加有效信息。建议优先覆盖现有 102 个漏检窗口，且至少跨 20 个视频、100 个困难窗口；数据不到位时不实现标注训练。
+
+### M141 动态对象集合检测头
+
+现有资源下唯一值得先做的全新结构是动态 seed 的对象集合检测头：从每个时间箱所有活跃空间单元生成 query，使用
+Hungarian 的 `target_id + time_bin` 集合监督，同时输出 query-conditioned 的事件级 mask，而不是像 M108 一样用
+固定 query 或中心半径吸附任意当前负事件。M26/M111 的生产 logits 默认保持不变，第一阶段只输出候选诊断，不接入提交。
+
+执行顺序已写入 `docs/M141_NEW_FRONTIERS_PLAN.md`：
+
+1. M141-A 只读审计候选映射、全部活跃单元覆盖率、显存/耗时和标签翻转不变性；不训练、不读取公开验证标签。
+2. 只有 A 通过，才做 outer=0、2 两折冻结对象头 probe；固定结构、3 epoch、AdamW，不换 query 数、不扫阈值。
+3. 只有两折低分带 AUC 都比 P41 至少 `+0.030`、bootstrap 下界为正、零背景校准各覆盖至少 20 个漏检窗、
+   候选精度至少 `5%` 且不丢已有目标，才允许五折 OOF。
+4. 五折必须 pooled Score 至少 `+0.0010`、Pd 不降、Fa 增量不超过 `5e-7`，之后才允许对 24 个公开验证视频做一次完整评估。
+
+当前状态：M141 仅完成研究规划，尚未实现、训练或接入生产；当前最高候选仍为 M111 + M124，Score=`0.9640370402`。
+没有通过 M141-A/B 之前，不给长训练命令，也不更新 README、正式 checkpoint、提交 TXT 或 Git。
+
+### M141 审计后的路线收敛
+
+进一步核对本地代码和资产后，三条路线的投入边界已经确定：
+
+- 外部 MEM/E2VID/RVT 不是当前可直接执行的路线。RVT 适配器依赖历史环境中的源码和 checkpoint，本地不存在；
+  E2VID/RVT 的冻结跨视频指标又低于 P41 control。除非拿到新的本地 checkpoint、源码、许可证和 SHA-256，
+  否则不下载、不换镜像、不改 patch、不解冻重训。
+- 标准 RVT/YOLO/DETR 框检测器停止。EV-UAV 只有事件级 `seg_label + target_id`，没有原生框/类别监督；
+  M121/M122 已经说明端到端残差在 outer 折上涨也可能在公开验证跨视频崩溃。要做框头需要新标注和大规模数据管线，
+  不是当前值得投入的短实验。
+- 现有数据上唯一保留的“全新结构”是 M141 动态 seed 的事件级对象集合头。它必须从无标签活跃事件单元生成 seed，
+  直接预测 query-conditioned event mask，不能复用 M108 固定 query、M95 中心半径吸附或 M123 objectness gate。
+  第一版保持 M111/M124 生产 logits 不变，只做候选诊断。
+
+因此当前实际下一步只有 M141-A 只读审计。若候选无法覆盖至少 85% 的残余漏检窗口、必须依赖 P41 top-k、
+单视频耗时/显存超限，或标签翻转影响候选，则立即停止，不训练；只有 A 通过后才考虑两折冻结 probe。最终仍以
+完整五折 pooled Challenge Score 相对 `0.9640370402` 至少 `+0.0010` 为准，任何单折 outer、AUC、训练 loss 或
+校准折正增量都不能作为采用依据。
+
+## M141-A：动态事件单元 query 候选空间审计（B 阶段停止）
+
+本轮实现 `log/analysis/audit_m141_dynamic_queries.py`，只读取 99 个训练视频、冻结
+`m26_targetflow_m20e3_epoch_003_seed53.pt` 和训练 P41 缓存。候选生成严格先于标签/P41 诊断：每个
+50-unit bin 的所有事件活跃 H/4 单元均成为 seed，坐标固定为 `(floor(y/4), floor(x/4))`，seed 为对应冻结
+decoder 特征向量。脚本不训练、不读取公开验证标签、不改正式 logits。
+
+必要条件均通过：全部视频特征形状为 `[160,16,65,87]`，原始事件映射错误为 0；三个低/中/高密度代表视频在
+翻转 `seg_label` 与 `target_id` 后重新 M26 前向，分数、特征、候选和 seed 均 bitwise 相同；冻结提取最坏为
+`5.3103 s/video`、`0.8867 GiB`。训练 P41 生产链的 738 个残余漏检目标窗在完整活跃单元候选集中的覆盖为
+`738/738=100%`，五折均为 `100%`。
+
+但这不是可训练准入，因为目标事件本身天然属于活跃单元。原定 M141-B 限制每 bin 最多 32 个 query；按唯一固定、
+无标签的诊断排序（单元事件数降序、cell id 升序）后，只覆盖 `351/738=47.56%` 残余窗，低密度路由为
+`65.10%`、高密度 M26 路由仅 `30.77%`。完整候选每 bin P90/最大为 `1,681/2,784`，每视频平均/P90/最大为
+`65,274/233,909/409,171`；32-query 已在 decoder 前丢失 387 个残余窗。
+
+若为避免截断而实现全候选稀疏/分块 decoder，需要在 646 万候选（仅 66,589 个含目标，即 `1.03%`）上重新做
+密集候选分割，既不再是低成本 probe，也没有 M26 H/4 以外的新信息。M95 冻结 H/4 heatmap 提议器、M108 对象
+query 与 M123 objectness 已分别证明同源候选排序不能稳定控制背景。因此**停止 M141-B/C**：不训练、不卡 query
+数量、不过滤 P41、不调阈值/epoch/seed、不看公开验证。审计报告为
+`log/analysis/m141_dynamic_query_audit.json`；当前完整公开验证最高仍为 M111 + M124，
+Score=`0.9640370402`。
+
+## M144：组件像素持久性下分位特征审计（否决）
+
+M124 的长期背景特征在 OOF 中有真实信号，但主要使用组件像素的均值/高分位统计，可能把移动目标与持久热噪声混在一起。
+M144 在不改变模型和生产 logits 的前提下，新增组件像素长期活动的最小值、中位数、下分位数、覆盖率，以及局部窗口外活动的
+下分位数/覆盖率；推理特征仍只来自整段无标签事件流。为避免组件分类器在单一折上过拟合，固定采用五折视频级、四个
+pair-excluded ExtraTrees 模型，只有四个模型均超过各自校准折的目标安全阈值才删除组件。未读取公开验证标签，也没有扫描
+阈值、特征子集或投票数。
+
+完整 99 个训练视频的固定 OOF 结果：
+
+| 指标 | 结果 |
+| --- | ---: |
+| 删除组件 | 179 |
+| 删除纯背景组件 | 178 |
+| 误删目标组件 | **1** |
+| Score 增量 | `+0.00044518` |
+| Pd 增量 | `0` |
+| IoU 增量 | `+0.00056595` |
+| Fa 增量 | `-1.24093497e-07` |
+
+虽然 `pixel_active_min`、`outside_min` 等单特征的跨折 AUC 高于原始均值特征，但组合门控的 OOF Score 远低于预注册的
+`+0.001`，且违反零目标组件误删条件。因此 **M144 停止**：不映射公开验证集、不接入 M124、不继续扫特征/阈值/投票数，
+也不训练新的组件分类器。报告为 `log/analysis/m144_component_persistence_audit.json`，审计脚本为
+`log/analysis/audit_m144_component_persistence.py`。当前完整公开验证最高仍为 **M111 + M124，Score=`0.9640370402`**。
+
+## M145：被 P0/P18 拒绝的高分组件连续性审计（否决）
+
+M127 指出 26 个公开验证目标窗的原始 P41 分数已经越过决策阈值，但最终被 P0/P18 整体拒绝。M145 不改变生产
+mask，也不扫描 `min_track_bins`、连接距离、候选下限或其他后处理参数；它只在冻结分数上检查一个不同的问题：
+被拒绝的高分组件是否具有可迁移的、无标签可观察的相邻 50-unit 高分组件支持。特征包括组件分数/规模、持续时间、
+前后相邻时间箱的最近质心距离、邻箱最高分和是否双侧支持。训练集使用 `m75_video_folds.json` 的显式视频折做
+OOF 线性头，验证缓存只在训练门槛完成后做一次描述性迁移统计。
+
+固定准入门槛为 pooled OOF AUC `>=0.75`、视频中位条件 AUC `>=0.65`、至少 `4/5` 折优于仅使用组件分数/规模的
+基线，并且训练缓存至少有 20 个含目标的被拒组件。实际完整训练缓存结果如下：
+
+| 指标 | 结果 |
+| --- | ---: |
+| 被拒原始高分组件 | 6,012（目标 988 / 背景 5,024） |
+| pooled OOF AUC（连续性特征） | `0.74397588` |
+| score-only 基线 AUC | `0.73049685` |
+| 视频中位 AUC | `0.71428571` |
+| 优于基线的 outer 折 | `3/5` |
+| 双侧邻箱支持组件 | 1,077 |
+
+虽然中位视频 AUC 高于数值门槛，但 pooled AUC 未达到 `0.75`，且只有 `3/5` 折方向为正，未通过联合准入条件。
+公开验证缓存中的被拒原始组件为 862 个（标签仅用于事后诊断），不能用来补救训练 OOF 失败。因此 M145 **停止**：
+不训练恢复头、不实现组件门控、不做验证集阈值选择、不扫描后处理参数。结果文件为
+`log/analysis/m145_rejected_track_signal_audit.json`，审计脚本为
+`log/analysis/audit_m145_rejected_track_signal.py`。当前完整公开验证最高仍为 **M111 + M124，Score=`0.9640370402`**。
+
+## M146：M26 H/4 动态 seed 残余单元可分性审计（否决）
+
+M141-A 只证明了无标签 H/4 活跃单元候选空间能够覆盖训练集全部残余漏检窗，尚未证明冻结 M26 解码特征
+能对这些候选提供独立排序。因此本轮不训练、不读取公开验证标签，只在 99 个训练视频上提取冻结 M26 的
+H/4 seed，并在最终生产链漏检的时间箱内做一次固定统计审计。比较对象包括 P41 单元最大分数和 seed 向量的
+均值、标准差、最小值、最大值、L2 范数及绝对均值；这些统计不进入生产决策。
+
+结果：共 `6,462,116` 个活跃单元，其中目标单元 `66,589` 个；生产链残余时间箱内有 `24,326` 个单元，
+仅 `143` 个目标单元、`24,183` 个背景单元。P41 单元最大分数 pooled AUC 为 `0.97788685`，而六个
+M26 seed 统计的最高 pooled AUC 仅 `0.58276475`（视频中位 AUC 最高约 `0.75186`）。因此 seed 本身没有
+足够的跨视频独立信息，不能支持 M141 的稀疏候选头或恢复器；M141 不进入训练、阈值扫描或完整验证。
+报告为 `log/analysis/m146_m26_h4_seed_separability.json`。
+
+## M147：M124 阈值与 M111 权重交互的完整总分复核（不采用）
+
+M124 的固定删除阈值 `0.90` 已经是当前最高方案的一部分。为排除“更保守阈值”或相位权重交互造成的遗漏，
+在完整 24 个验证视频上各做一次预先固定回放，除指定开关外严格保持 M10/M26、P41、P6、P0/P0c、P18-global
+和 M124 特征/模型不变。
+
+| 配置 | IoU | Pd | Fa | Score |
+| --- | ---: | ---: | ---: | ---: |
+| 当前 M111 + M124（阈值 `0.90`、相位权重 `0.25`） | `0.9425080419` | `0.9785804284` | `4.6129243890e-06` | **`0.9640370402`** |
+| M124 阈值 `0.95` | `0.9423274994` | `0.9785804284` | `4.6514394931e-06` | `0.9638906165` |
+| M124 阈值 `0.97`（验证集无组件触发） | `0.9422997832` | `0.9785804284` | `4.6573648938e-06` | `0.9638681055` |
+| 相位权重 `0.20` + M124 阈值 `0.90` | `0.9423640966` | `0.9785804284` | `4.6247751903e-06` | `0.9639651422` |
+
+两种变体均低于当前完整总分，不能把训练 OOF 或局部 Fa/IoU 改善当成提分依据。M124 阈值保持 `0.90`、
+M111 相位权重保持 `0.25`；不再继续扫相位权重、verifier 阈值或逐视频阈值。临时回放权重已清理，正式
+checkpoint、README 和 Git 均未修改。
+
+## M148：M134R outer=4 task-vector 完整验证（否决）
+
+M134R 在单个 outer=4 折曾报告弱正增益，但这不代表完整验证可迁移。本轮直接使用已生成的
+`log/analysis/m134_outer4_resumed_candidate_seed134.pt` 作为高密度 M26 主模型，保持 M10 路由、M111
+相位专家、P41、P6、P0/P0c、P18-global 和 M124 verifier 完全不变，在全部 24 个公开验证视频上只做一次
+总分回放。
+
+结果为：`IoU=0.9423025846`、`Acc=0.9760785103`、`Pd=0.9781604368`、`Fa=4.6069989884e-06`、
+`Score_Fa=0.9549751213`、`Score=0.9638250791`。相对当前 M111 + M124 的 `0.9640370402`，总分
+下降 `0.0002119611`，主要原因是 Pd 下降 `0.0004199916`；Fa 的改善不足以抵消召回损失。
+因此 M134 task-vector 不接入生产，不扫描 alpha、不换 seed、不补训练，也不更新 README、正式 checkpoint
+或提交文件。该结果与 outer=3 的负方向共同说明局部 task-vector 增益不具备跨视频稳定性。
+
+## M149：M124 verifier 增强标签跨视频审计（否决）
+
+本轮检验一个允许但容易误用的数据利用方式：把已有 24 个公开验证视频中的标签并入 M124 纯背景组件
+verifier 的训练，期待它在最终测试视频上作为无标签组件删除器获得更好的跨域校准。为模拟未知测试域，
+固定把验证视频按可观察事件数排序后轮转为 5 个视频级留出折；每个折的 held-out 视频既不参与分类器训练，
+也不参与“已知目标组件概率最大值 + 1e-6”的删除阈值确定。对照模型只用 99 个训练视频，增强模型用 99
+个训练视频加其余 4 个验证折。特征仍只来自事件坐标、时间、模型分数和冻结 M26/P41 输出，主模型和正式
+推理链均未修改。
+
+`log/analysis/audit_m124_augmented_labels.py` 修复了直接启动时的项目导入路径，并在 EV39/WSL 完整运行；
+报告为 `log/analysis/m124_augmented_labels_oof.json`：
+
+| 指标 | 结果 |
+| --- | ---: |
+| 增强 verifier 平均 Score 增量 | `-0.0005486784` |
+| 增强 verifier 最小/最大折增量 | `-0.0014783202 / +0.0010603181` |
+| Score 非负折数 | `1/5` |
+| 含目标组件误删的折数 | `4/5` |
+
+虽然增强标签在某些折提高了背景压制能力，但没有改善跨视频总分，且目标误删明显；不满足预注册的平均
+`+0.0002`、至少 `4/5` 正折和每折零目标误删门槛。因此 M149 停止：不使用验证标签训练最终 verifier，
+不扫描阈值，不映射到 24 视频完整评分，也不更新正式 checkpoint、README 或 Git。
+
+## M150：M20/per-video 无标签路由 OOF（否决）
+
+队友方案的一个可能普适化方向是：不在测试视频上读标签，而是在训练视频上学习固定的“整段事件流可观察描述 -> M10/M20/max/混合候选”路由。为补足此前 M98 没有训练集 M20 分数的缺口，先用本地冻结的 `m20_attn_dense_views8_epoch_003_seed48.pt` 对 99 个训练视频生成 `log/analysis/m20_component_router/train_m20_scores.pt`，随后固定 6 个候选：当前 P41、M20、逐事件 max、75/25 混合，以及两个保守阈值变体。路由特征只使用事件坐标/时间箱、事件密度、两分数源的分位数和差异；采用 5 折视频留出，外折视频不参与路由拟合或效用估计，未读取公开验证标签。
+
+脚本为 `log/analysis/audit_m150_m20_video_router.py`，报告为 `log/analysis/m150_m20_video_router_oof.json`。修正 IoU 分母为官方的“正事件总数 + FP”后结果如下：
+
+| 配置 | 训练集五折 pooled Score | 相对 P41 |
+| --- | ---: | ---: |
+| P41 基线 | `0.9256642714` | `0` |
+| M20 固定 | `0.9225761823` | `-0.0030880892` |
+| max 固定 | `0.9217818792` | `-0.0038823922` |
+| Ridge 路由 | `0.9250664800` | `-0.0005977915` |
+| ExtraTrees 路由（几乎全 abstain） | `0.9256627986` | `-0.0000014729` |
+
+Ridge 五折全部为负；ExtraTrees 只选择 1 个非基线视频，仍未达到预注册的 pooled `+0.0002`、至少 `4/5` 非负折和每折 Pd 不下降门槛。故 M150 停止：不把 M20 路由映射到公开验证，不扫描更多候选/阈值/模型，也不将该缓存接入生产。该结果说明队友逐视频选择的收益不能通过当前可观察域统计稳定预测。
+
+## M169：事件密度/极性域阈值复核（不采用）
+
+本轮审计了缓存中曾出现的 `0.9641189` 候选。固定策略只使用完整视频可观察信息：事件数 `<=30000` 用 `0.718`，
+`30000--200000` 用 `0.728`，高密度视频按原始事件极性少数类比例 `<0.20` 分为 `0.722` 或 `0.724`。
+此前推理端误把只有 `[x,y,t]` 的 `ev_loc` 当作带极性的输入，导致极性分支全部回退；本轮已改为读取 `evs_norm[:,3]`，
+并用同一修正后的 `test2.py` 完整复核。
+
+完整 24 个验证视频结果：`IoU=0.9425585270`、`Acc=0.9761853814`、`Pd=0.9785804284`、
+`Fa=4.5862600862e-06`、`Score=0.9641143728`，相对当前正式提交候选 `0.9640370402` 为 `+0.0000773327`。
+该分数与此前三域阈值结果相同（极性高密度分支只改变 1 个视频的阈值，最终事件掩码未改变），没有复现缓存中的精确
+`0.9641189`。
+
+为检查跨视频泛化，使用 `log/analysis/m169_threshold_only_oof.json` 对 99 个训练视频做固定阈值-only 五折 OOF：
+pooled Score 仅 `+0.00003863`，Pd `-0.00019735`，且 1/5 折降分；再叠加 M124 verifier 的 OOF 更差，5 折全部 Pd
+下降并误删 243 个目标组件（`log/analysis/m169_domain_threshold_oof.json`）。因此该方向不能作为最终测试集的无标签
+普适方案，不更新正式最高分、checkpoint、README 或 Git；当前正式最高完整分数仍为 **M111 + M124，0.9640370402**。
+
+## M172：全局事件位移 phase-correlation 补充（重复路线，否决）
+
+针对 M127 发现的高速目标漏检，误再次尝试了一个不训练、完全不读取标签的视频级预处理探针：把事件按固定
+`50` 时间单位生成占用图，用相邻图的 phase-correlation 估计全局位移；仅对原始分数至少 `0.53` 且在
+相邻时间箱按估计位移 `5` 像素内有支持的事件做单调补充。固定相位响应门槛为 `0.10`、最大位移为
+`12` 像素，不按视频、标签或验证集调参。实现和复现报告为
+`log/analysis/audit_m172_motion_compensation.py`、`log/analysis/m172_motion_compensation_probe.json`。
+
+99 个训练视频五折 OOF 结果：基线 Score `0.9257299736`，补充后 `0.8586136406`，增量
+`-0.0671163330`；Pd 虽增加 `0.0074008289`，但 Fa 增加 `2.0589e-05`、IoU 下降 `0.1066600680`。
+共接受 `219038` 个事件，说明全局占用图的位移主要描述背景事件和噪声，不是目标运动。该结果与已经完成的
+M89（多速度累计）和 M92（共享背景位移残差）结论一致，因此 M172 不构成新证据：不接入预处理或后处理，
+不训练、不扫描 phase 参数，也不映射公开验证集。后续禁止以 phase-correlation、全局位移、速度网格或
+运动补偿的改名变体重复这条路线。
+
+## M177：TESPEC Gen4 外部监督表征冻结探针（否决）
+
+为寻找真正不同于当前 M26/P41 表征的方向，本轮下载并严格审计了 TESPEC Gen4 事件目标检测公开权重
+`/tmp/m176_tespec_assets/TESPEC_Gen4.ckpt`（SHA-256=`801e38975230739cb5d38e13b0b3797a6d388b011d921f250102deb8d1d01651`）。
+与已否决的 TESPEC 自监督权重相比，Gen4 的 `177/177` 个 backbone tensor 均严格匹配，且同一事件流的
+H/4 特征余弦接近零，确认不是重复 checkpoint。缓存阶段只读取事件坐标、时间和极性，不读取标签、视频名或
+target id；候选集合、20 通道 stacked histogram、三线性头、五折 cyclic OOF、6 epoch、batch 4096 和校准阈值
+全部与 M142 固定一致。99 个视频冻结缓存耗时约 544 秒，显存稳定约 0.18 GiB。
+
+完整 `log/analysis/m177_tespec_gen4_dense_cell_oof.json` 结果：
+
+| 指标 | 结果 |
+| --- | ---: |
+| 候选漏检窗覆盖率 | `0.90785908` |
+| P41 pooled missed-vs-background AUC | `0.77584024` |
+| Gen4-only pooled AUC | `0.69296962` |
+| P41 + Gen4 combined pooled AUC | `0.77128386` |
+| combined 相对 P41 pooled AUC | `-0.00455638` |
+| combined 视频中位 AUC 增量 | `-0.01535346` |
+| combined 为正的 outer 折 | `2/5` |
+| 校准阈值恢复漏检窗 | `0/738` |
+
+候选覆盖率虽超过 `0.85`，但 combined AUC、视频中位增量、正折数和恢复漏检窗数均未达到预注册门槛，且
+Gen4-only 明显弱于 P41。因此 M177 明确停止：不扫描特征/head/epoch/阈值，不接入事件掩码，不跑公开验证，
+不更新 README、正式 checkpoint、提交 txt 或 Git。该结果说明“换成外部监督 backbone”本身不能提供稳定的
+跨视频独立排序信息；后续不再重复 TESPEC/MEM 类冻结 backbone 替换路线。
+
+## M178：SAST 外部监督稀疏 Transformer 冻结探针（否决）
+
+TESPEC/MEM/RVT 等外部表征已无效后，为避免继续在当前 M26/P41 周边小修小补，验证了结构不同且可复现的
+CVPR 2024 SAST（Scene Adaptive Sparse Transformer）公开 1MPx 事件检测 checkpoint。权重
+`/tmp/m178_sast_step440k.ckpt` 的 SHA-256 为
+`f4da583d04d25defe85cd9a31986e4127d30f289ac373a150471925a99708904`；其 `mdl.backbone.*` 与官方
+SASTRNN 的 `208/208` 个 tensor 严格匹配。输入固定为 20 通道 stacked histogram，EV-UAV 的 `346x260`
+事件图按保持比例缩放到 `384x511` 后水平居中 letterbox 到 `384x640`，只取 stage-1 的 H/4、64 维冻结特征。
+
+为防止把外部 backbone 的局部排序误当作提分，候选集合、P41 特征、训练视频划分、三线性 BCE head、6 epoch、
+batch 4096、学习率和校准阈值全部固定复用 M142：候选为 `max P41 >= 0.10` 的原生 H/4 cell x 50-unit
+时间箱。缓存阶段仅读取 `(x,y,t,polarity)` 与冻结 P41 候选，明确不读取 `seg_label`、`target_id`、视频名或
+公开验证视频；99 个视频缓存耗时 `1318.71 s`，总计 `551019` 个候选，峰值显存约 `0.143 GiB`，全部 shard
+无 NaN/Inf。标签只在缓存不可变后用于五折 cyclic `3-fold fit / 1-fold calibration / 1-fold outer` OOF。
+
+完整报告 `log/analysis/m178_sast_dense_cell_oof.json` 结果如下：
+
+| 指标 | 结果 |
+| --- | ---: |
+| 候选漏检窗覆盖率 | `0.90785908` |
+| P41 pooled missed-vs-background AUC | `0.75833963` |
+| SAST-only pooled AUC | `0.66255694` |
+| P41 + SAST combined pooled AUC | `0.78453260` |
+| combined 相对 P41 pooled AUC | `+0.02619297` |
+| combined 视频中位 AUC 增量 | `+0.00121743` |
+| combined 为正的 outer 折 | `3/5` |
+| 校准阈值恢复漏检窗 | `0/738` |
+
+虽然 pooled AUC 有正增量，但没有达到预注册的 `+0.030`，视频中位增量远低于 `+0.020`，outer=3、4 分别为
+`-0.01182383`、`-0.01984566`，且零背景校准下没有恢复任何漏检窗。它不具备跨视频稳定性，也没有证明可以
+转换为最终官方 Score 的保守增益。因此 M178 否决：不做 event-mask 集成、不跑公开验证、不训练、不扫描
+head/epoch/阈值/FPN，不更新 README、正式 checkpoint、提交 txt 或 Git。这个结果进一步说明“替换成外部
+事件检测冻结 backbone”不足以带来可部署的总分提升；若重新探索外部资源，必须是能直接改变对象级候选覆盖或
+提供与 P41 明确互补的时空监督，而不是再换一个同类 backbone。

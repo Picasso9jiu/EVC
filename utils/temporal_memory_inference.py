@@ -564,7 +564,13 @@ def load_temporal_memory_model(
     width,
     sequence_length=None,
 ):
-    """Load a temporal-memory checkpoint and validate its saved architecture."""
+    """Load a temporal-memory checkpoint and validate its saved architecture.
+
+    ``width=None`` is used for auxiliary routed experts.  Their channel width
+    is taken from checkpoint metadata so a widened primary model can coexist
+    with the historical width-16 M10/M111 experts without changing either
+    model's weights or outputs.
+    """
     checkpoint_path = Path(checkpoint_path)
     if not checkpoint_path.is_file():
         raise FileNotFoundError(
@@ -574,6 +580,9 @@ def load_temporal_memory_model(
     saved = checkpoint.get('temporal_memory', {})
     saved_context_bins = saved.get('context_bins')
     saved_width = saved.get('width')
+    saved_normalization_max_groups = int(
+        saved.get('normalization_max_groups', 8)
+    )
     saved_sequence_length = saved.get('sequence_length')
     saved_density_calibration = bool(
         saved.get('density_calibration_enabled', False)
@@ -583,6 +592,9 @@ def load_temporal_memory_model(
     )
     saved_temporal_attention = bool(
         saved.get('temporal_attention_enabled', False)
+    )
+    saved_temporal_attention_num_heads = int(
+        saved.get('temporal_attention_num_heads', 4)
     )
     saved_attention_relative_bias = bool(
         saved.get('attention_relative_bias_enabled', False)
@@ -605,6 +617,15 @@ def load_temporal_memory_model(
     saved_target_level_downsample = int(
         saved.get('target_level_downsample', 4)
     )
+    saved_objectness_gate = bool(
+        saved.get('objectness_gate_enabled', False)
+    )
+    saved_objectness_gate_strength = float(
+        saved.get('objectness_gate_strength', 0.5)
+    )
+    saved_objectness_gate_downsample = int(
+        saved.get('objectness_gate_downsample', 4)
+    )
     saved_center_memory = bool(saved.get('center_memory_enabled', False))
     saved_center_memory_channels = int(
         saved.get('center_memory_channels', 4)
@@ -624,7 +645,12 @@ def load_temporal_memory_model(
                 saved_context_bins, context_bins
             )
         )
-    if saved_width is not None and int(saved_width) != int(width):
+    model_width = saved_width if width is None else width
+    if model_width is None:
+        raise ValueError(
+            'Checkpoint does not contain width metadata and no width was configured.'
+        )
+    if saved_width is not None and width is not None and int(saved_width) != int(width):
         raise ValueError(
             'Checkpoint width={} does not match configured {}.'.format(
                 saved_width, width
@@ -642,10 +668,12 @@ def load_temporal_memory_model(
         )
     model = BidirectionalTemporalMemoryNet(
         input_channels=int(context_bins) * 2,
-        width=int(width),
+        width=int(model_width),
+        normalization_max_groups=saved_normalization_max_groups,
         density_calibration_enabled=saved_density_calibration,
         confidence_head_enabled=saved_confidence_head,
         temporal_attention_enabled=saved_temporal_attention,
+        temporal_attention_num_heads=saved_temporal_attention_num_heads,
         temporal_attention_relative_bias_enabled=saved_attention_relative_bias,
         temporal_attention_relative_bias_max_distance=(
             saved_attention_relative_bias_max_distance
@@ -661,6 +689,9 @@ def load_temporal_memory_model(
         target_center_enabled=saved_target_center,
         target_level_enabled=saved_target_level,
         target_level_downsample=saved_target_level_downsample,
+        objectness_gate_enabled=saved_objectness_gate,
+        objectness_gate_strength=saved_objectness_gate_strength,
+        objectness_gate_downsample=saved_objectness_gate_downsample,
         center_memory_enabled=saved_center_memory,
         center_memory_channels=saved_center_memory_channels,
         center_memory_downsample=saved_center_memory_downsample,
@@ -720,6 +751,19 @@ def horizontal_flip_temporal_memory_video(video, width):
     mirrored_locations = locations.copy()
     mirrored_locations[:, 0] = width - 1 - mirrored_locations[:, 0]
     return replace(video, locations=mirrored_locations)
+
+
+def polarity_invert_temporal_memory_video(video):
+    """Swap OFF/ON event channels while preserving event index alignment."""
+    polarities = np.asarray(video.polarities)
+    if polarities.ndim != 1 or polarities.shape[0] != video.locations.shape[0]:
+        raise ValueError('video polarities must be flat and align with event locations.')
+    if polarities.size and not np.all((polarities == 0.0) | (polarities == 1.0)):
+        raise ValueError('polarity inversion requires binary 0/1 polarities.')
+    return replace(
+        video,
+        polarities=(1.0 - polarities).astype(np.float32, copy=False),
+    )
 
 
 def temporal_phase_shift_temporal_memory_video(

@@ -13,6 +13,7 @@ from configs.configs import cfg
 from dataset.ev_uav import EvUAV
 from model.evspsegnet import evspsegnet
 from utils.challenge_eval import add_batch_to_evaluator, evaluate_challenge_metrics
+from utils.component_background_verifier import ComponentBackgroundVerifier
 from utils.density_threshold import DensityAdaptiveThresholdConfig
 from utils.ensemble import ChallengePredictor
 from utils.eval import evalute
@@ -142,7 +143,7 @@ if __name__ == "__main__":
                 temporal_memory_config.secondary_model_path,
                 device,
                 cfg.temporal_memory_context_bins,
-                cfg.temporal_memory_width,
+                None,
                 None,
             )
         if temporal_memory_config.has_blend_model:
@@ -150,7 +151,7 @@ if __name__ == "__main__":
                 temporal_memory_config.blend_model_path,
                 device,
                 cfg.temporal_memory_context_bins,
-                cfg.temporal_memory_width,
+                None,
                 None,
             )
         if temporal_memory_config.dense_specialist_enabled:
@@ -158,7 +159,7 @@ if __name__ == "__main__":
                 temporal_memory_config.dense_specialist_model_path,
                 device,
                 cfg.temporal_memory_context_bins,
-                cfg.temporal_memory_width,
+                None,
                 None,
             )
         if temporal_memory_config.fine_time_expert_enabled:
@@ -174,7 +175,7 @@ if __name__ == "__main__":
                 temporal_memory_config.phase_specialist_model_path,
                 device,
                 cfg.temporal_memory_context_bins,
-                cfg.temporal_memory_width,
+                None,
                 None,
             )
             if not phase_tta_config.enabled:
@@ -388,6 +389,15 @@ if __name__ == "__main__":
     print("temporal-frame expert:", temporal_frame_config.describe())
     print("temporal-memory expert:", temporal_memory_config.describe())
     postprocessor = ChallengePostprocessor.from_cfg(cfg, PREDICTION_THRESHOLD)
+    background_verifier = ComponentBackgroundVerifier.from_cfg(cfg)
+    if background_verifier is not None:
+        print(
+            "M124 background verifier: enabled (threshold {:.2f})".format(
+                background_verifier.threshold
+            )
+        )
+    else:
+        print("M124 background verifier: disabled")
     postprocess_stats = postprocessor.new_stats()
     threshold_usage = {}
     print("postprocessor:", postprocessor.describe())
@@ -402,6 +412,11 @@ if __name__ == "__main__":
         or temporal_frame_config.enabled
         or temporal_memory_config.enabled
     )
+    if background_verifier is not None and not sample_level_inference:
+        raise ValueError(
+            "M124 background verifier requires per-video inference; enable a "
+            "full-stream or sample-level route."
+        )
     if not sample_level_inference:
         dataloader = torch.utils.data.DataLoader(
             dataset,
@@ -673,19 +688,30 @@ if __name__ == "__main__":
             if not full_stream_only and chunk_config.should_partition(event_count):
                 p8_partitioned_videos += 1
                 p8_chunk_count += chunk_count
-            batch_threshold = threshold_policy.threshold_for_event_count(
+            batch_threshold = threshold_policy.threshold_for_sample(
                 event_count,
+                sample["evs_norm"],
                 PREDICTION_THRESHOLD,
             )
             batch_postprocessor = (
                 ChallengePostprocessor.from_cfg(cfg, batch_threshold)
                 if threshold_policy.enabled else postprocessor
             )
+            raw_predictions = predictions.detach().clone()
             predictions, batch_postprocess_stats = batch_postprocessor.apply(
                 predictions,
                 batch["locs"],
             )
             postprocess_stats.merge(batch_postprocess_stats)
+            if background_verifier is not None:
+                verifier_result = background_verifier.apply(
+                    raw_predictions,
+                    predictions,
+                    batch["locs"],
+                    batch_threshold,
+                    event_count,
+                )
+                predictions = verifier_result.scores
             if threshold_policy.enabled:
                 predictions = (predictions >= batch_threshold).to(predictions.dtype)
             threshold_usage[batch_threshold] = threshold_usage.get(batch_threshold, 0) + 1
@@ -707,8 +733,9 @@ if __name__ == "__main__":
                     event_frame=batch.get("event_frame"),
                     source_event_count=batch["locs"].shape[0],
                 )
-                batch_threshold = threshold_policy.threshold_for_event_count(
+                batch_threshold = threshold_policy.threshold_for_sample(
                     predictions.numel(),
+                    batch.get("event_features"),
                     PREDICTION_THRESHOLD,
                 )
                 batch_postprocessor = (

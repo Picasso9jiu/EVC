@@ -1,9 +1,22 @@
 """Event-point losses for full-frame temporal segmentation."""
 
 import math
+import os
 
 import torch
 import torch.nn.functional as functional
+
+
+def _grid_sample(input_tensor, grid, **kwargs):
+    """Use a deterministic CPU sampler for strict paired CUDA probes."""
+    if (
+        input_tensor.is_cuda
+        and os.environ.get('EVSOD_DETERMINISTIC_WARP_CPU', '').strip() == '1'
+    ):
+        return functional.grid_sample(
+            input_tensor.cpu(), grid.cpu(), **kwargs
+        ).to(input_tensor.device)
+    return functional.grid_sample(input_tensor, grid, **kwargs)
 
 
 def generate_gaussian_soft_labels(
@@ -184,7 +197,13 @@ def frame_balanced_quality_focal_loss(
             )
         weights = torch.ones_like(sample_loss)
         if positive_weight != 1.0:
-            weights[positive_mask] = positive_weight
+            # ``torch.where`` avoids a PyTorch 1.9 CUDA boolean-index write
+            # assertion when strict deterministic kernels are enabled.
+            weights = torch.where(
+                positive_mask,
+                torch.full_like(weights, positive_weight),
+                weights,
+            )
         per_view_losses.append((sample_loss * weights).sum() / weights.sum())
         positive_weights.append(positive_weight)
 
@@ -469,7 +488,7 @@ def target_level_velocity_loss(
                 current_center[0] * (2.0 / max(width - 1, 1)) - 1.0,
                 current_center[1] * (2.0 / max(height - 1, 1)) - 1.0,
             )).reshape(1, 1, 1, 2).to(dtype=velocity_maps.dtype)
-            predicted = functional.grid_sample(
+            predicted = _grid_sample(
                 velocity_maps[time_index:time_index + 1],
                 grid,
                 mode='bilinear',
@@ -562,7 +581,13 @@ def frame_balanced_event_bce(
             )
         weights = torch.ones_like(sample_loss)
         if positive_weight != 1.0:
-            weights[positive_mask] = positive_weight
+            # Avoid the PyTorch 1.9 CUDA boolean-index write assertion under
+            # strict deterministic kernels.
+            weights = torch.where(
+                positive_mask,
+                torch.full_like(weights, positive_weight),
+                weights,
+            )
         per_view_losses.append((sample_loss * weights).sum() / weights.sum())
         positive_weights.append(positive_weight)
 
@@ -1011,7 +1036,7 @@ def target_centroid_flow_loss(
                 current_center[0] * (2.0 / (input_width - 1)) - 1.0,
                 current_center[1] * (2.0 / (input_height - 1)) - 1.0,
             )).reshape(1, 1, 1, 2)
-            predicted = functional.grid_sample(
+            predicted = _grid_sample(
                 flow,
                 sample_grid.to(dtype=flow.dtype),
                 mode='bilinear',
@@ -1154,7 +1179,7 @@ def target_centroid_trajectory_flow_loss(
                     position[0] * (2.0 / (flow_width - 1.0)) - 1.0,
                     position[1] * (2.0 / (flow_height - 1.0)) - 1.0,
                 )).reshape(1, 1, 1, 2)
-                step = functional.grid_sample(
+                step = _grid_sample(
                     flow,
                     sample_grid,
                     mode='bilinear',

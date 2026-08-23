@@ -1,5 +1,6 @@
 """Sequence views for the bidirectional full-stream temporal memory model."""
 
+import json
 from collections import OrderedDict
 from pathlib import Path
 
@@ -119,6 +120,8 @@ class TemporalMemoryTrainDataset(Dataset):
         temporal_phase_offset=0,
         local_temporal_context_enabled=False,
         local_temporal_context_kernel_size=11,
+        fold_manifest_path='',
+        train_folds='',
     ):
         self.root = Path(root)
         self.whole_t = int(whole_t)
@@ -206,11 +209,61 @@ class TemporalMemoryTrainDataset(Dataset):
         self.local_temporal_context_kernel_size = int(
             local_temporal_context_kernel_size
         )
+        self.fold_manifest_path = str(fold_manifest_path or '').strip()
+        self.train_folds = str(train_folds or '').strip()
         self.current_epoch = 0
 
         self.file_paths = sorted(self.root.glob('*.npz'))
         if not self.file_paths:
             raise RuntimeError('No npz files found in {}'.format(self.root))
+        if self.fold_manifest_path or self.train_folds:
+            if not self.fold_manifest_path or not self.train_folds:
+                raise ValueError(
+                    'fold_manifest_path and train_folds must be provided together.'
+                )
+            requested_folds = set()
+            for token in self.train_folds.split(','):
+                token = token.strip()
+                if token:
+                    requested_folds.add(int(token))
+            if not requested_folds:
+                raise ValueError('train_folds must contain at least one fold.')
+            with Path(self.fold_manifest_path).open('r', encoding='utf-8') as stream:
+                manifest = json.load(stream)
+            records = manifest.get('records')
+            if not isinstance(records, list) or not records:
+                raise ValueError('Fold manifest records are missing or empty.')
+            fold_by_name = {}
+            for record in records:
+                name = str(record.get('name', '')).strip()
+                if not name or 'fold' not in record:
+                    raise ValueError('Fold manifest contains an invalid record.')
+                if name in fold_by_name:
+                    raise ValueError('Fold manifest contains duplicate video names.')
+                fold_by_name[name] = int(record['fold'])
+            missing_manifest_names = [
+                path.name for path in self.file_paths if path.name not in fold_by_name
+            ]
+            if missing_manifest_names:
+                raise ValueError(
+                    'Fold manifest does not cover training videos: {}'.format(
+                        missing_manifest_names[:5]
+                    )
+                )
+            self.file_paths = [
+                path
+                for path in self.file_paths
+                if fold_by_name[path.name] in requested_folds
+            ]
+            if not self.file_paths:
+                raise RuntimeError(
+                    'No training videos belong to requested folds {}.'.format(
+                        sorted(requested_folds)
+                    )
+                )
+            self.selected_folds = tuple(sorted(requested_folds))
+        else:
+            self.selected_folds = None
         if self.context_bins < 1 or self.context_bins % 2 == 0:
             raise ValueError('context_bins must be a positive odd integer.')
         if self.sequence_length <= 0:
@@ -735,6 +788,7 @@ class TemporalMemoryTrainDataset(Dataset):
 
         frames = []
         event_time_indices = []
+        event_times = []
         event_x = []
         event_y = []
         labels = []
@@ -765,6 +819,7 @@ class TemporalMemoryTrainDataset(Dataset):
             event_time_indices.append(
                 np.full(event_indices.shape, sequence_index, dtype=np.int64)
             )
+            event_times.append(locations[:, 2].astype(np.int64, copy=False))
             event_x.append(locations[:, 0].astype(np.int64, copy=False))
             event_y.append(locations[:, 1].astype(np.int64, copy=False))
             labels.append(sampling_video.labels[event_indices].astype(np.float32, copy=False))
@@ -786,6 +841,10 @@ class TemporalMemoryTrainDataset(Dataset):
         return {
             'frames': frames,
             'event_time_indices': np.concatenate(event_time_indices),
+            # Preserve raw timestamps for training-only losses tied to the
+            # official 50-unit Pd windows. Local sequence indices are not a
+            # substitute because each sampled view starts at a different bin.
+            'event_times': np.concatenate(event_times),
             'event_x': event_x,
             'event_y': np.concatenate(event_y),
             'labels': np.concatenate(labels),
@@ -803,6 +862,7 @@ def temporal_memory_collate(samples):
         'event_time_indices': torch.from_numpy(
             sample['event_time_indices']
         ).long(),
+        'event_times': torch.from_numpy(sample['event_times']).long(),
         'event_x': torch.from_numpy(sample['event_x']).long(),
         'event_y': torch.from_numpy(sample['event_y']).long(),
         'labels': torch.from_numpy(sample['labels']).float(),

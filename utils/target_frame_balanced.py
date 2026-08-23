@@ -1,6 +1,7 @@
 """Training loss that balances positive supervision across target frames."""
 
 import torch
+import torch.nn.functional as functional
 
 
 def target_frame_balanced_positive_loss(
@@ -10,6 +11,7 @@ def target_frame_balanced_positive_loss(
     locations,
     temporal_bin_size,
     eps=1e-5,
+    from_logits=False,
 ):
     """Average positive BCE equally over official target-time groups.
 
@@ -18,6 +20,11 @@ def target_frame_balanced_positive_loss(
     gradients event-level but first averages events within each target frame,
     then averages the target-frame losses. Events on bin boundaries are
     excluded because the official evaluator excludes them from Pd as well.
+
+    ``predictions`` are probabilities by default for compatibility with the
+    original STC loss path. Set ``from_logits`` for the temporal-memory
+    trainer so its auxiliary positive BCE remains numerically stable for
+    low-confidence target windows.
     """
     predictions = predictions.reshape(-1)
     labels = labels.reshape(-1)
@@ -48,8 +55,13 @@ def target_frame_balanced_positive_loss(
     if not torch.any(target_mask):
         return predictions.sum() * 0, 0
 
-    selected_predictions = torch.clamp(predictions[target_mask], min=0, max=1)
-    event_losses = -torch.log(selected_predictions + float(eps))
+    if from_logits:
+        event_losses = functional.softplus(-predictions[target_mask])
+    else:
+        selected_predictions = torch.clamp(
+            predictions[target_mask], min=0, max=1
+        )
+        event_losses = -torch.log(selected_predictions + float(eps))
     selected_target_ids = target_ids[target_mask]
     batch_ids = locations[target_mask, 0].long()
     time_bins = torch.div(

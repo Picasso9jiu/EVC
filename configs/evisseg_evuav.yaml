@@ -182,11 +182,23 @@ POSTPROCESS:
   p18_velocity_gate_enabled: false
   p18_velocity_gate_base_link_distance: 6.0
   p18_velocity_gate_max_acceleration: 3.0
+  # M124: frozen, label-free verifier for final persistent-background components.
+  # It is disabled by default so historical inference commands are unchanged.
+  m124_background_verifier_enabled: false
+  m124_background_verifier_model_path: ""
+  m124_background_verifier_threshold: 0.90
   # P6: density-adaptive decision threshold; disabled by default.
   p6_density_threshold_enabled: false
   p6_event_count_cutoff: 100000
   p6_low_density_threshold: 0.70
   p6_high_density_threshold: 0.92
+  # Optional M169 audit policy; disabled preserves the original P6 rule.
+  p6_polarity_domain_enabled: false
+  p6_middle_event_count_cutoff: 200000
+  p6_middle_density_threshold: 0.728
+  p6_high_polarity_minority_cutoff: 0.20
+  p6_high_imbalanced_threshold: 0.722
+  p6_high_balanced_threshold: 0.724
 
 FUSION:
   # P3-Lite: disabled by default; enable with --set FUSION.p3_lite_enabled=true
@@ -282,6 +294,8 @@ TEMPORAL_MEMORY:
   temporal_memory_bin_size: 50
   temporal_memory_context_bins: 5
   temporal_memory_width: 16
+  # M140 can widen a released M26 model while preserving its GroupNorm layout.
+  temporal_memory_normalization_max_groups: 8
   temporal_memory_sequence_length: 16
   temporal_memory_train_views_per_video: 2
   temporal_memory_positive_frame_probability: 0.75
@@ -339,7 +353,28 @@ TEMPORAL_MEMORY:
   temporal_memory_metric_component_ratio: 0.01
   temporal_memory_metric_activation_threshold: 0.70
   temporal_memory_metric_activation_temperature: 0.10
+  # M137: training-only equal positive BCE mass per official target-time
+  # group. Disabled by default so released M26 inference is unchanged.
+  temporal_memory_target_frame_balanced_enabled: false
+  temporal_memory_target_frame_balanced_weight: 0.01
+  temporal_memory_target_frame_balanced_warmup_epochs: 0
+  temporal_memory_target_frame_balanced_temporal_bin_size: 50
   temporal_memory_log_count_clip: 4.0
+  # M134: paired teacher-selective metric direction; disabled by default.
+  temporal_memory_teacher_selective_metric_enabled: false
+  temporal_memory_teacher_selective_teacher_path: ""
+  temporal_memory_teacher_selective_target_weight: 0.005
+  temporal_memory_teacher_selective_component_weight: 0.001
+  temporal_memory_teacher_selective_warmup_epochs: 1
+  temporal_memory_teacher_selective_threshold: 0.7226
+  temporal_memory_teacher_selective_spatial_cell_size: 3
+  temporal_memory_teacher_selective_min_cell_events: 2
+  temporal_memory_teacher_selective_component_ratio: 0.01
+  # M134R: continue only the treatment arm from an exact control warmup
+  # checkpoint. Empty paths preserve the normal training path.
+  temporal_memory_m134_resume_checkpoint_path: ""
+  temporal_memory_m134_resume_state_path: ""
+  temporal_memory_m134_resume_start_epoch: 0
   # M72: a zero-attached local temporal-background residual adapter.
   temporal_memory_local_temporal_context_enabled: false
   temporal_memory_local_temporal_context_kernel_size: 11
@@ -348,6 +383,9 @@ TEMPORAL_MEMORY:
   temporal_memory_cache_all_videos: true
   temporal_memory_cache_video_count: 16
   temporal_memory_train_workers: 0
+  # Optional strict whole-video fold filter for nested outer evaluation.
+  temporal_memory_fold_manifest: ""
+  temporal_memory_train_folds: ""
   temporal_memory_inference_batch_size: 8
   temporal_memory_model_path: ""
   # Optional second full-stream checkpoint, blended before postprocessing.
@@ -396,6 +434,8 @@ TEMPORAL_MEMORY:
   # zero-initialized residual confidence head.
   temporal_memory_confidence_only_enabled: false
   temporal_memory_temporal_attention_enabled: false
+  # M140 keeps the historical 24-channel attention head width when widened.
+  temporal_memory_attention_num_heads: 4
   temporal_memory_attention_output_init_std: 0.0
   # M24: directional, distance-aware bias for temporal self-attention.
   temporal_memory_attention_relative_bias_enabled: false
@@ -450,6 +490,20 @@ TEMPORAL_MEMORY:
   temporal_memory_target_level_velocity_huber_delta: 2.0
   temporal_memory_target_level_lr_multiplier: 0.5
   temporal_memory_target_level_downsample: 4
+  # M123: target-level objectness that gates a zero-initialized event residual.
+  temporal_memory_objectness_gate_enabled: false
+  temporal_memory_objectness_gate_strength: 0.50
+  temporal_memory_objectness_gate_downsample: 4
+  temporal_memory_objectness_center_loss_weight: 0.025
+  temporal_memory_objectness_presence_loss_weight: 0.010
+  temporal_memory_objectness_velocity_loss_weight: 0.010
+  temporal_memory_objectness_teacher_weight: 0.05
+  temporal_memory_objectness_preserve_weight: 0.50
+  temporal_memory_objectness_teacher_margin: 0.25
+  temporal_memory_objectness_lr_multiplier: 1.0
+  # M132: keep M26 fixed except flow; objectness heads remain training-only
+  # supervision and the zero event gate is frozen at identity.
+  temporal_memory_objectness_flow_only_enabled: false
   temporal_memory_center_memory_enabled: false
   temporal_memory_center_memory_channels: 4
   temporal_memory_center_memory_downsample: 4

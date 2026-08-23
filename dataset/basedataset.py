@@ -133,6 +133,10 @@ class BaseDataLoader(torch.utils.data.Dataset):
         output['seg_label'] = torch.from_numpy(seg_label_batches)
         output['p2v_map'] = p2v_map
         output['locs'] = locs_batches
+        # Preserve the raw [x, y, t, p, ...] event features for inference
+        # policies that use observable polarity.  ``locs`` intentionally has
+        # only [batch, x, y, t] and cannot provide this field.
+        output['event_features'] = feature_batches
         output['idx_label'] = idx_label_batches
         if event_frame_batches:
             if len(event_frame_batches) != batch_size:

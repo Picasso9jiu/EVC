@@ -3,7 +3,7 @@
 ## EV-UAV Challenge 2 当前最优方案复现
 
 本分支保存 EV-UAV Challenge 2 当前已验证的事件级微小目标检测方案：按输入事件数路由的
-全事件流双向时序记忆网络，并在高密度分支加入时序自注意力、目标质心监督的有界平流对齐和半时间箱相位集成。仓库包含复现当前分数所需的
+全事件流双向时序记忆网络，并在高密度分支加入时序自注意力、目标质心监督的有界平流对齐、半时间箱相位集成和长期背景组件 verifier。仓库包含复现当前分数所需的
 代码、固定配置、验证脚本、提交生成脚本和 checkpoint；无需重新训练即可直接验证。
 
 本仓库同时提供中文实验日志 [`note.md`](note.md)。日志按实验编号记录各方向的动机、运行命令、
@@ -16,7 +16,29 @@
 以下分数来自 `val/` 的 24 个视频，是本地验证结果，不代表未知官方测试集分数。不同 CUDA、
 PyTorch、spconv 或 HAIS_OP 编译版本可能造成轻微数值差异。
 
-## M26 + P41 已验证结果
+## 当前最高验证候选：M111 + M124
+
+在正式 M26/P41 基线之后，当前公开 24 个验证视频上的最高完整分数为：
+
+| 指标 | 数值 |
+| --- | ---: |
+| IoU | **0.9425080419** |
+| Acc | 0.9762769938 |
+| Pd | 0.9785804284 |
+| Fa | **4.6129243890e-06** |
+| Score_Fa | **0.9549185368** |
+| Score | **0.9640370402** |
+
+该候选在 M111（三个独立相位专家等权平均）上增加 M124 长期背景 verifier。verifier 只使用当前完整
+视频的事件坐标、时间和模型分数，在 P0/P0c/P18 后删除背景概率不低于 `0.90` 的最终组件；不使用
+视频名、target id 或测试标签。训练好的 verifier 文件为
+`checkpoints/m124_m115_long_background_verifier_v1.pkl.gz`，其特征定义和训练统计见 `note.md`。
+该分数是本地公开验证集结果，最终测试集仍需使用同一固定开关，不应做逐视频标签调参。注意：固定 `0.90`
+在训练视频五折 OOF 中会误删少量含目标组件并使 Pd 下降，因此它是当前最高**提交候选**，而不是已证明
+跨域安全的正式替代；保守正式基线仍是 M26/P41 的 `0.9638562171`。
+
+相对正式 M26/P41 基线，Score 提升 `+0.0001808231`，Pd 不变，IoU 提升 `+0.0002057553`，Fa 下降。
+M26/P41 基线结果仍保留如下，便于定位 verifier 或环境差异：
 
 | 指标 | 数值 |
 | --- | ---: |
@@ -35,7 +57,7 @@ Score = 0.4 * Pd + 0.3 * Score_Fa + 0.2 * IoU + 0.1 * Acc
 ```
 
 M26 从 M20 epoch 003 零扰动挂接，训练保存 12 个 checkpoint。最佳 Challenge 2 checkpoint 是
-**epoch 003**；在高密度路由叠加固定 P41 相位集成、P6、P0/P0c 与 P18-global 后，以完整 `test2.py` 得到本节分数。训练 loss 最低的是 epoch 011，验证分数反而明显更低，不能以训练 loss 选模型。
+**epoch 003**；在高密度路由叠加固定 P41 相位集成、P6、P0/P0c 与 P18-global 后得到正式基线。训练 loss 最低的是 epoch 011，验证分数反而明显更低，不能以训练 loss 选模型。
 
 ## M26 方案组成
 
@@ -61,7 +83,8 @@ M26 的 flow 输出层采用零初始化。因此从 M20 加载时 flow 严格�
 4. 按 P6 的密度自适应阈值生成初始二值事件。
 5. 应用 P0 时空连通簇过滤，再应用 P0c 高置信恢复。
 6. 应用 P18-global 弱轨迹恢复，每个符合条件的组件仅恢复一个最优事件。
-7. 生成提交时保留原始 `x y t p`，仅写入最终二值 `label`。
+7. M124 verifier 在最终阈值化前删除背景概率不低于 `0.90` 的最终组件。
+8. 生成提交时保留原始 `x y t p`，仅写入最终二值 `label`。
 
 所有路由条件都只依赖可观察的输入事件数。推理过程中不读取验证标签、目标 ID 或视频名称规则。
 
@@ -73,18 +96,20 @@ M26 的 flow 输出层采用零初始化。因此从 M20 加载时 flow 严格�
 | `checkpoints/m10_dense_views2_epoch_002_seed42.pt` | 固定低密度路由模型 | `5C89C89A165469C0A4E8286D4644D60D2F82CF5775EDBB724F626E24E67D8935` |
 | `checkpoints/m20_attn_dense_views8_epoch_003_seed48.pt` | 固定高密度 M20 模型 | `4B8B2B19EA9D913EE4E52CB21AE52BF945B2B0F3CEFD5CB5AB6F64D51BF49849` |
 | `checkpoints/m26_targetflow_m20e3_epoch_003_seed53.pt` | 固定高密度 M26 模型 | `13F7D4D8AB6BDCAAA98F3F906A7D32E687C17454B88B42B94752EEC04257F7C4` |
+| `checkpoints/m111_phase_specialist_seed72_73_76_average.pt` | M111 三 seed 相位专家平均 | `15FD690E3BB177649F2A995AAF00B947FD6AC0DFB147EA6A9CDF5847B96ADED2` |
+| `checkpoints/m124_m115_long_background_verifier_v1.pkl.gz` | M124 纯背景组件 verifier | `B39A2DD93A2B6B499F558338FCFEE3B7BD20F8CECCFB66499549617E832D1C8B` |
 
-直接评估当前最优方案只需要 M10 和 M26；P41 是无参数的推理期集成，不需要额外 checkpoint。M20 是 M26 的训练初始化，M4 只在下文的完整重训链条中使用。
+直接评估当前最高候选需要 M10、M26、M111 和 M124 verifier；P41 是无参数的推理期集成。M20 是 M26 的训练初始化，M4 只在下文的完整重训链条中使用。
 
 ## 仓库结构
 
 ```text
 EVSOD-main/
-|-- checkpoints/                 # 直接复现所需的 M10、M26 及完整重训起点权重
+|-- checkpoints/                 # 当前最高方案的 M10、M26、M111 与 M124 权重
 |-- configs/evisseg_evuav.yaml   # 固定配置
 |-- dataset/                     # 数据集目录，不上传 Git
 |-- model/temporal_memory_net.py # ConvGRU、时序自注意力和有界平流对齐
-|-- utils/                       # 全事件流推理与 Challenge 2 评估器
+|-- utils/                       # 全事件流推理、评估器和 M124 verifier
 |-- train_temporal_memory.py     # M13/M15/M20/M26 训练入口
 |-- test2.py                     # 本地 Challenge 2 验证
 |-- submit_challenge2.py         # 提交 TXT 生成
@@ -113,7 +138,7 @@ python -m pip install \
 python -m pip install \
   numpy==1.23.5 pyyaml==6.0.2 tqdm==4.66.5 pandas==2.0.3 \
   opencv-python==4.8.1.78 mlflow==2.17.2 spconv-cu111 \
-  typing-extensions==4.12.2 pillow==10.4.0
+  typing-extensions==4.12.2 pillow==10.4.0 scikit-learn==1.6.1
 ```
 
 安装 PyTorch 后首次编译 HAIS_OP。系统需要兼容的 CUDA Toolkit、C++ 编译器和
@@ -168,14 +193,16 @@ dataset/训练集、验证集/
 版本化的 M4+DACC+M5 起点按完整训练链条重新生成 M26，适合研究复现。两条路径都使用前文完成的
 环境配置和数据目录。
 
-### 1. **免训练评估**：直接复现当前最高分
+### 1. **免训练评估**：直接复现当前最高候选
 
-下列命令直接使用仓库中的 M10/M26 权重，按当前固定策略在 24 个验证视频上评估，不需要训练。
+下列命令使用 M10/M26/M111 和 M124 verifier，在 24 个验证视频上直接复现当前最高候选，不需要训练。
 在已验证 GPU 环境中通常需要数分钟。
 
 ```bash
 M10_CKPT="$PROJECT_DIR/checkpoints/m10_dense_views2_epoch_002_seed42.pt"
 M26_CKPT="$PROJECT_DIR/checkpoints/m26_targetflow_m20e3_epoch_003_seed53.pt"
+M111_CKPT="$PROJECT_DIR/checkpoints/m111_phase_specialist_seed72_73_76_average.pt"
+M124_VERIFIER="$PROJECT_DIR/checkpoints/m124_m115_long_background_verifier_v1.pkl.gz"
 
 python test2.py --config configs/evisseg_evuav.yaml --set \
   DATA.root="$DATA_ROOT" \
@@ -185,6 +212,11 @@ python test2.py --config configs/evisseg_evuav.yaml --set \
   TEMPORAL_MEMORY.temporal_memory_model_path="$M26_CKPT" \
   TEMPORAL_MEMORY.temporal_memory_secondary_model_path="$M10_CKPT" \
   TEMPORAL_MEMORY.temporal_memory_secondary_max_event_count=30000 \
+  TEMPORAL_MEMORY.temporal_memory_phase_specialist_enabled=true \
+  TEMPORAL_MEMORY.temporal_memory_phase_specialist_model_path="$M111_CKPT" \
+  TEMPORAL_MEMORY.temporal_memory_phase_specialist_event_count_cutoff=30000 \
+  TEMPORAL_MEMORY.temporal_memory_phase_specialist_weight=0.25 \
+  TEMPORAL_MEMORY.temporal_memory_phase_specialist_offset=25 \
   TEMPORAL_MEMORY.temporal_memory_temporal_attention_enabled=true \
   TEMPORAL_MEMORY.temporal_memory_sparse_weight=0.0 \
   TEMPORAL_MEMORY.temporal_memory_inference_batch_size=8 \
@@ -206,7 +238,10 @@ python test2.py --config configs/evisseg_evuav.yaml --set \
   POSTPROCESS.p6_density_threshold_enabled=true \
   POSTPROCESS.p6_event_count_cutoff=30000 \
   POSTPROCESS.p6_low_density_threshold=0.718 \
-  POSTPROCESS.p6_high_density_threshold=0.7226
+  POSTPROCESS.p6_high_density_threshold=0.7226 \
+  POSTPROCESS.m124_background_verifier_enabled=true \
+  POSTPROCESS.m124_background_verifier_model_path="$M124_VERIFIER" \
+  POSTPROCESS.m124_background_verifier_threshold=0.90
 ```
 
 P41 的四项覆盖必须使用 `INFERENCE_TTA.p41_*` 前缀。配置加载会把分组字段展平；若误写为
@@ -215,13 +250,19 @@ P41 的四项覆盖必须使用 `INFERENCE_TTA.p41_*` 前缀。配置加载会�
 预期输出接近：
 
 ```text
-IoU:      0.9423022866
-Acc:      0.9763227701
+IoU:      0.9425080419
+Acc:      0.9762769938
 Pd:       0.9785804284
-Fa:       4.6632902944e-06
-Score_Fa: 0.9544377181
-Score:    0.9638562171
+Fa:       4.6129243890e-06
+Score_Fa: 0.9549185368
+Score:    0.9640370402
 ```
+
+### 1.1 正式 M26/P41 基线回归
+
+若需要排查环境差异或对比 verifier 增益，将上一条命令中的 M111 五项覆盖和 M124 三项覆盖去掉，
+即可得到正式 M26/P41 基线，预期 `Score=0.9638562171`。M124 配置默认关闭，旧命令无需修改即可保持
+该基线。
 
 ### 2. 从版本化起点完整重训 M26
 
@@ -355,12 +396,14 @@ test -n "$M26_E3"
 
 ### 3. 生成 Challenge 2 提交文件
 
-提交必须使用与 **免训练评估** 完全相同的 M10/M26 权重及固定参数，只将验证选项替换为输出目录：
+提交必须使用与 **免训练评估** 完全相同的 M10/M26/M111/M124 权重及固定参数，只将验证选项替换为输出目录：
 
 ```bash
-OUTPUT_DIR="$PROJECT_DIR/log/challenge2/m26_e3_m10low30000"
+OUTPUT_DIR="$PROJECT_DIR/log/challenge2/m111_m124_current_best"
 M10_CKPT="$PROJECT_DIR/checkpoints/m10_dense_views2_epoch_002_seed42.pt"
 M26_CKPT="$PROJECT_DIR/checkpoints/m26_targetflow_m20e3_epoch_003_seed53.pt"
+M111_CKPT="$PROJECT_DIR/checkpoints/m111_phase_specialist_seed72_73_76_average.pt"
+M124_VERIFIER="$PROJECT_DIR/checkpoints/m124_m115_long_background_verifier_v1.pkl.gz"
 
 python submit_challenge2.py --config configs/evisseg_evuav.yaml --set \
   DATA.root="$DATA_ROOT" \
@@ -370,6 +413,11 @@ python submit_challenge2.py --config configs/evisseg_evuav.yaml --set \
   TEMPORAL_MEMORY.temporal_memory_model_path="$M26_CKPT" \
   TEMPORAL_MEMORY.temporal_memory_secondary_model_path="$M10_CKPT" \
   TEMPORAL_MEMORY.temporal_memory_secondary_max_event_count=30000 \
+  TEMPORAL_MEMORY.temporal_memory_phase_specialist_enabled=true \
+  TEMPORAL_MEMORY.temporal_memory_phase_specialist_model_path="$M111_CKPT" \
+  TEMPORAL_MEMORY.temporal_memory_phase_specialist_event_count_cutoff=30000 \
+  TEMPORAL_MEMORY.temporal_memory_phase_specialist_weight=0.25 \
+  TEMPORAL_MEMORY.temporal_memory_phase_specialist_offset=25 \
   TEMPORAL_MEMORY.temporal_memory_temporal_attention_enabled=true \
   TEMPORAL_MEMORY.temporal_memory_sparse_weight=0.0 \
   TEMPORAL_MEMORY.temporal_memory_inference_batch_size=8 \
@@ -391,10 +439,13 @@ python submit_challenge2.py --config configs/evisseg_evuav.yaml --set \
   POSTPROCESS.p6_density_threshold_enabled=true \
   POSTPROCESS.p6_event_count_cutoff=30000 \
   POSTPROCESS.p6_low_density_threshold=0.718 \
-  POSTPROCESS.p6_high_density_threshold=0.7226
+  POSTPROCESS.p6_high_density_threshold=0.7226 \
+  POSTPROCESS.m124_background_verifier_enabled=true \
+  POSTPROCESS.m124_background_verifier_model_path="$M124_VERIFIER" \
+  POSTPROCESS.m124_background_verifier_threshold=0.90
 
 cd "$OUTPUT_DIR"
-zip -j ../m26_e3_m10low30000.zip val_*.txt
+zip -j ../m111_m124_current_best.zip val_*.txt
 ```
 
 ## 引用

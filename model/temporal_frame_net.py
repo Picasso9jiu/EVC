@@ -1,5 +1,7 @@
 """A compact full-frame temporal event segmentation network."""
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as functional
@@ -17,6 +19,18 @@ def _group_count(channels, maximum_groups=8):
         if channels % group_count == 0:
             return group_count
     return 1
+
+
+def _interpolate(input_tensor, **kwargs):
+    """Keep pair-audit interpolation off CUDA's nondeterministic backward."""
+    if (
+        input_tensor.is_cuda
+        and os.environ.get('EVSOD_DETERMINISTIC_WARP_CPU', '').strip() == '1'
+    ):
+        return functional.interpolate(input_tensor.cpu(), **kwargs).to(
+            input_tensor.device
+        )
+    return functional.interpolate(input_tensor, **kwargs)
 
 
 def append_local_contrast_channels(inputs, kernel_size=9):
@@ -100,7 +114,13 @@ def build_motion_persistence_channels(
 class ConvNormAct(nn.Module):
     """Three-by-three convolution with batch-size-independent normalization."""
 
-    def __init__(self, in_channels, out_channels, dilation=1):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        dilation=1,
+        normalization_max_groups=8,
+    ):
         super().__init__()
         dilation = int(dilation)
         self.layers = nn.Sequential(
@@ -112,7 +132,13 @@ class ConvNormAct(nn.Module):
                 dilation=dilation,
                 bias=False,
             ),
-            nn.GroupNorm(_group_count(out_channels), out_channels),
+            nn.GroupNorm(
+                _group_count(
+                    out_channels,
+                    maximum_groups=normalization_max_groups,
+                ),
+                out_channels,
+            ),
             nn.ReLU(inplace=True),
         )
 
@@ -123,9 +149,20 @@ class ConvNormAct(nn.Module):
 class ResidualConvBlock(nn.Module):
     """A two-convolution residual block that preserves fine target detail."""
 
-    def __init__(self, in_channels, out_channels, dilation=1):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        dilation=1,
+        normalization_max_groups=8,
+    ):
         super().__init__()
-        self.first = ConvNormAct(in_channels, out_channels, dilation=dilation)
+        self.first = ConvNormAct(
+            in_channels,
+            out_channels,
+            dilation=dilation,
+            normalization_max_groups=normalization_max_groups,
+        )
         self.second = nn.Sequential(
             nn.Conv2d(
                 out_channels,
@@ -135,7 +172,13 @@ class ResidualConvBlock(nn.Module):
                 dilation=int(dilation),
                 bias=False,
             ),
-            nn.GroupNorm(_group_count(out_channels), out_channels),
+            nn.GroupNorm(
+                _group_count(
+                    out_channels,
+                    maximum_groups=normalization_max_groups,
+                ),
+                out_channels,
+            ),
         )
         self.skip = (
             nn.Identity()
@@ -149,7 +192,7 @@ class ResidualConvBlock(nn.Module):
 
 
 class DownBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, normalization_max_groups=8):
         super().__init__()
         self.layers = nn.Sequential(
             nn.Conv2d(
@@ -160,9 +203,19 @@ class DownBlock(nn.Module):
                 padding=1,
                 bias=False,
             ),
-            nn.GroupNorm(_group_count(out_channels), out_channels),
+            nn.GroupNorm(
+                _group_count(
+                    out_channels,
+                    maximum_groups=normalization_max_groups,
+                ),
+                out_channels,
+            ),
             nn.ReLU(inplace=True),
-            ResidualConvBlock(out_channels, out_channels),
+            ResidualConvBlock(
+                out_channels,
+                out_channels,
+                normalization_max_groups=normalization_max_groups,
+            ),
         )
 
     def forward(self, inputs):
@@ -170,15 +223,22 @@ class DownBlock(nn.Module):
 
 
 class UpBlock(nn.Module):
-    def __init__(self, in_channels, skip_channels, out_channels):
+    def __init__(
+        self,
+        in_channels,
+        skip_channels,
+        out_channels,
+        normalization_max_groups=8,
+    ):
         super().__init__()
         self.block = ResidualConvBlock(
             int(in_channels) + int(skip_channels),
             out_channels,
+            normalization_max_groups=normalization_max_groups,
         )
 
     def forward(self, inputs, skip):
-        inputs = functional.interpolate(
+        inputs = _interpolate(
             inputs,
             size=skip.shape[-2:],
             mode='bilinear',
@@ -254,6 +314,7 @@ class TemporalFrameNet(nn.Module):
         target_center_enabled=False,
         confidence_head_enabled=False,
         density_calibration_enabled=False,
+        normalization_max_groups=8,
     ):
         super().__init__()
         input_channels = int(input_channels)
@@ -262,6 +323,7 @@ class TemporalFrameNet(nn.Module):
         motion_persistence_channels = int(motion_persistence_channels)
         fine_detail_channels = int(fine_detail_channels)
         local_temporal_context_channels = int(local_temporal_context_channels)
+        normalization_max_groups = int(normalization_max_groups)
         if input_channels <= 0 or width <= 0:
             raise ValueError('input_channels and width must be positive.')
         if local_contrast_channels < 0:
@@ -274,6 +336,8 @@ class TemporalFrameNet(nn.Module):
             raise ValueError(
                 'local_temporal_context_channels must not be negative.'
             )
+        if normalization_max_groups <= 0:
+            raise ValueError('normalization_max_groups must be positive.')
 
         self.input_channels = input_channels
         self.local_contrast_channels = local_contrast_channels
@@ -283,10 +347,15 @@ class TemporalFrameNet(nn.Module):
         self.target_center_enabled = bool(target_center_enabled)
         self.confidence_head_enabled = bool(confidence_head_enabled)
         self.density_calibration_enabled = bool(density_calibration_enabled)
+        self.normalization_max_groups = normalization_max_groups
         width2 = width * 2
         width4 = width * 4
         width6 = width * 6
-        self.encoder0 = ResidualConvBlock(input_channels, width)
+        self.encoder0 = ResidualConvBlock(
+            input_channels,
+            width,
+            normalization_max_groups=normalization_max_groups,
+        )
         self.local_contrast_adapter = None
         if local_contrast_channels:
             self.local_contrast_adapter = nn.Conv2d(
@@ -331,16 +400,53 @@ class TemporalFrameNet(nn.Module):
             )
             nn.init.zeros_(self.local_temporal_context_adapter.weight)
             nn.init.zeros_(self.local_temporal_context_adapter.bias)
-        self.encoder1 = DownBlock(width, width2)
-        self.encoder2 = DownBlock(width2, width4)
-        self.encoder3 = DownBlock(width4, width6)
-        self.context = nn.Sequential(
-            ResidualConvBlock(width6, width6, dilation=2),
-            ResidualConvBlock(width6, width6, dilation=4),
+        self.encoder1 = DownBlock(
+            width,
+            width2,
+            normalization_max_groups=normalization_max_groups,
         )
-        self.decoder2 = UpBlock(width6, width4, width4)
-        self.decoder1 = UpBlock(width4, width2, width2)
-        self.decoder0 = UpBlock(width2, width, width)
+        self.encoder2 = DownBlock(
+            width2,
+            width4,
+            normalization_max_groups=normalization_max_groups,
+        )
+        self.encoder3 = DownBlock(
+            width4,
+            width6,
+            normalization_max_groups=normalization_max_groups,
+        )
+        self.context = nn.Sequential(
+            ResidualConvBlock(
+                width6,
+                width6,
+                dilation=2,
+                normalization_max_groups=normalization_max_groups,
+            ),
+            ResidualConvBlock(
+                width6,
+                width6,
+                dilation=4,
+                normalization_max_groups=normalization_max_groups,
+            ),
+        )
+        self.decoder2 = UpBlock(
+            width6,
+            width4,
+            width4,
+            normalization_max_groups=normalization_max_groups,
+        )
+        self.decoder1 = UpBlock(
+            width4,
+            width2,
+            width2,
+            normalization_max_groups=normalization_max_groups,
+        )
+        self.decoder0 = UpBlock(
+            width2,
+            width,
+            width,
+            normalization_max_groups=normalization_max_groups,
+        )
         self.head = nn.Conv2d(width, 1, kernel_size=1)
 
         # P32 keeps P23's event head intact at initialization. The centre head
@@ -350,7 +456,11 @@ class TemporalFrameNet(nn.Module):
         self.target_center_residual = None
         if self.target_center_enabled:
             self.target_center_head = nn.Sequential(
-                ConvNormAct(width, width),
+                ConvNormAct(
+                    width,
+                    width,
+                    normalization_max_groups=normalization_max_groups,
+                ),
                 nn.Conv2d(width, 1, kernel_size=1),
             )
             nn.init.zeros_(self.target_center_head[-1].weight)
@@ -365,7 +475,10 @@ class TemporalFrameNet(nn.Module):
 
         self.confidence_head = None
         if self.confidence_head_enabled:
-            self.confidence_head = ConfidenceHead(width)
+            self.confidence_head = ConfidenceHead(
+                width,
+                normalization_max_groups=normalization_max_groups,
+            )
 
         self.density_calibrator = None
         if self.density_calibration_enabled:
