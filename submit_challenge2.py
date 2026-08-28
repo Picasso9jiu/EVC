@@ -17,6 +17,7 @@ from utils.inference_chunks import (
     evaluation_batch_from_sample,
 )
 from utils.postprocess import ChallengePostprocessor
+from utils.track_quality_bonus import P32TrackQualityBonus
 from utils.spatial_tta import HorizontalFlipTTAConfig
 from utils.temporal_frame_inference import (
     TemporalFrameInferenceConfig,
@@ -420,8 +421,14 @@ if __name__ == "__main__":
     else:
         print("M124 background verifier: disabled")
     postprocess_stats = postprocessor.new_stats()
+    p32_track_bonus = P32TrackQualityBonus.from_cfg(
+        cfg,
+        PREDICTION_THRESHOLD,
+    )
+    p32_track_bonus_stats = p32_track_bonus.new_stats()
     threshold_usage = {}
     print("postprocessor:", postprocessor.describe())
+    print("P32 track-quality bonus:", p32_track_bonus.describe())
 
     dataset = EvUAV(cfg, mode="val")
     dataset.file_list = sorted(dataset.file_list)
@@ -657,6 +664,15 @@ if __name__ == "__main__":
                 locations,
             )
             postprocess_stats.merge(batch_postprocess_stats)
+            batch_p32_track_bonus = (
+                P32TrackQualityBonus.from_cfg(cfg, batch_threshold)
+                if threshold_policy.enabled else p32_track_bonus
+            )
+            predictions, batch_p32_track_bonus_stats = batch_p32_track_bonus.apply(
+                predictions,
+                locations,
+            )
+            p32_track_bonus_stats.merge(batch_p32_track_bonus_stats)
             if background_verifier is not None:
                 verifier_result = background_verifier.apply(
                     raw_predictions,
@@ -699,6 +715,15 @@ if __name__ == "__main__":
                     locations,
                 )
                 postprocess_stats.merge(batch_postprocess_stats)
+                batch_p32_track_bonus = (
+                    P32TrackQualityBonus.from_cfg(cfg, batch_threshold)
+                    if threshold_policy.enabled else p32_track_bonus
+                )
+                predictions, batch_p32_track_bonus_stats = batch_p32_track_bonus.apply(
+                    predictions,
+                    locations,
+                )
+                p32_track_bonus_stats.merge(batch_p32_track_bonus_stats)
                 threshold_usage[batch_threshold] = threshold_usage.get(batch_threshold, 0) + 1
 
                 for local_index in batch_ids.unique(sorted=True).tolist():
@@ -715,6 +740,7 @@ if __name__ == "__main__":
 
     pbar.close()
     print("postprocess result:", postprocess_stats.summary())
+    print("P32 track-quality bonus result:", p32_track_bonus_stats.summary())
     if chunk_config.enabled and not full_stream_only:
         print(
             "P8 random chunk result: {} high-density videos, {} chunk forwards".format(

@@ -53,6 +53,7 @@ class TemporalMemoryInferenceConfig:
     phase_specialist_event_count_cutoff: int = 30000
     phase_specialist_weight: float = 0.25
     phase_specialist_offset: int = 25
+    phase_specialist_blend_compatible: bool = False
     local_temporal_context_enabled: bool = False
     local_temporal_context_kernel_size: int = 11
 
@@ -299,6 +300,13 @@ class TemporalMemoryInferenceConfig:
             ),
             phase_specialist_offset=int(
                 getattr(cfg, 'temporal_memory_phase_specialist_offset', 25)
+            ),
+            phase_specialist_blend_compatible=_as_bool(
+                getattr(
+                    cfg,
+                    'temporal_memory_phase_specialist_blend_compatible',
+                    False,
+                )
             ),
             local_temporal_context_enabled=_as_bool(
                 getattr(
@@ -593,6 +601,8 @@ def load_temporal_memory_model(
     saved_temporal_attention = bool(
         saved.get('temporal_attention_enabled', False)
     )
+    saved_temporal_diff = bool(saved.get('temporal_diff_enabled', False))
+    saved_ssa = bool(saved.get('ssa_enabled', False))
     saved_temporal_attention_num_heads = int(
         saved.get('temporal_attention_num_heads', 4)
     )
@@ -672,6 +682,8 @@ def load_temporal_memory_model(
         normalization_max_groups=saved_normalization_max_groups,
         density_calibration_enabled=saved_density_calibration,
         confidence_head_enabled=saved_confidence_head,
+        temporal_diff_enabled=saved_temporal_diff,
+        ssa_enabled=saved_ssa,
         temporal_attention_enabled=saved_temporal_attention,
         temporal_attention_num_heads=saved_temporal_attention_num_heads,
         temporal_attention_relative_bias_enabled=saved_attention_relative_bias,

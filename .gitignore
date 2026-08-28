@@ -6,6 +6,7 @@ runs/
 checkpoints/m124_m115_long_background_verifier_v1.pkl
 !checkpoints/m111_phase_specialist_seed72_73_76_average.pt
 !checkpoints/m124_m115_long_background_verifier_v1.pkl.gz
+!checkpoints/m124_m115_long_background_verifier_v1_threshold089.pkl.gz
 
 # Python
 __pycache__/

@@ -3,7 +3,8 @@
 ## EV-UAV Challenge 2 当前最优方案复现
 
 本分支保存 EV-UAV Challenge 2 当前已验证的事件级微小目标检测方案：按输入事件数路由的
-全事件流双向时序记忆网络，并在高密度分支加入时序自注意力、目标质心监督的有界平流对齐、半时间箱相位集成和长期背景组件 verifier。仓库包含复现当前分数所需的
+全事件流双向时序记忆网络，并在高密度分支加入时序自注意力、目标质心监督的有界平流对齐、半时间箱相位集成、
+长期背景组件 verifier 和无标签轨迹质量加分。仓库包含复现当前分数所需的
 代码、固定配置、验证脚本、提交生成脚本和 checkpoint；无需重新训练即可直接验证。
 
 本仓库同时提供中文实验日志 [`note.md`](note.md)。日志按实验编号记录各方向的动机、运行命令、
@@ -16,28 +17,38 @@
 以下分数来自 `val/` 的 24 个视频，是本地验证结果，不代表未知官方测试集分数。不同 CUDA、
 PyTorch、spconv 或 HAIS_OP 编译版本可能造成轻微数值差异。
 
-## 当前最高验证候选：M111 + M124
+## 当前最高验证候选：M111 + M169 + P32(seed=3) + M124(0.89)
 
 在正式 M26/P41 基线之后，当前公开 24 个验证视频上的最高完整分数为：
 
 | 指标 | 数值 |
 | --- | ---: |
-| IoU | **0.9425080419** |
-| Acc | 0.9762769938 |
-| Pd | 0.9785804284 |
-| Fa | **4.6129243890e-06** |
+| IoU | **0.9429009557** |
+| Acc | **0.9765975475** |
+| Pd | **0.9787904242** |
+| Fa | **4.5892227865e-06** |
 | Score_Fa | **0.9549185368** |
-| Score | **0.9640370402** |
+| Score | **0.9642995840** |
 
-该候选在 M111（三个独立相位专家等权平均）上增加 M124 长期背景 verifier。verifier 只使用当前完整
-视频的事件坐标、时间和模型分数，在 P0/P0c/P18 后删除背景概率不低于 `0.90` 的最终组件；不使用
-视频名、target id 或测试标签。训练好的 verifier 文件为
-`checkpoints/m124_m115_long_background_verifier_v1.pkl.gz`，其特征定义和训练统计见 `note.md`。
-该分数是本地公开验证集结果，最终测试集仍需使用同一固定开关，不应做逐视频标签调参。注意：固定 `0.90`
-在训练视频五折 OOF 中会误删少量含目标组件并使 Pd 下降，因此它是当前最高**提交候选**，而不是已证明
-跨域安全的正式替代；保守正式基线仍是 M26/P41 的 `0.9638562171`。
+该候选在 M111（三个独立相位专家等权平均）上叠加三项固定、无标签规则：M169 根据全视频 event 数和极性
+少数类比例选择阈值；P32 只对至少三个高分 seed 支持、持续至少四个时间箱且近似匀速的已观察轨迹加
+`0.010`；M124 在最终阈值化前删除背景概率不低于 `0.89` 的组件。它们都只使用当前完整视频的事件坐标、
+时间、极性和模型分数，不使用视频名、target id 或测试标签。发布的 verifier 为
+`checkpoints/m124_m115_long_background_verifier_v1_threshold089.pkl.gz`；特征定义、训练统计和全部
+失败方向记录在 `note.md`。
 
-相对正式 M26/P41 基线，Score 提升 `+0.0001808231`，Pd 不变，IoU 提升 `+0.0002057553`，Fa 下降。
+该分数是本地公开验证集结果，未知测试集不能保证得到同样增量；最终测试必须使用同一固定开关，不做逐视频
+标签调参。M124 从 `0.90` 下调到 `0.89` 的选择经过 99 个训练视频五折整视频留出：五折 pooled Score
+`+0.0007104073`，5/5 outer 折正向。相对上一完整候选
+`M111 + P32(seed=2) + M124(0.90)` 的 `0.9641980199`，本方案完整 Score 提升
+`+0.0001015641`，平台按四舍五入显示为 `0.9643`；保守 M26/P41 基线仍为 `0.9638562171`。
+
+已用本文第 1 节的固定免训练命令完整评估 24 个视频，日志为
+`log/analysis/m187_m169_p32seed3_m124089_full_verify.log`。正式复现只依赖下文列出的 M10、M26、M111
+与 M124 四个文件；M188 及其他实验 checkpoint 均不参与路由、推理或提交。
+
+相对正式 M26/P41 基线，Score 提升 `+0.0004433669`，Pd 提升 `+0.0002100`，IoU 提升
+`+0.0005986691`，Fa 降低 `7.4067592e-08`。
 M26/P41 基线结果仍保留如下，便于定位 verifier 或环境差异：
 
 | 指标 | 数值 |
@@ -69,9 +80,10 @@ M26 从 M20 epoch 003 零扰动挂接，训练保存 12 个 checkpoint。最佳 
 | M26 新增模块 | 有界平流对齐和目标质心位移监督 | 让递归记忆随标注目标的相邻时间箱运动对齐 |
 | 训练采样 | `event_count > 200000` 的视频每轮使用 8 个确定性视图 | 提高高密度输入的时序覆盖 |
 | P41 相位集成 | 仅 `event_count > 30000`，时间偏移 `25`，原流/偏移流权重 `0.75/0.25` | 降低 50-unit 时间分箱边界对高密度目标轨迹的影响 |
-| P6 阈值 | 低密度 `0.718`，其他 `0.7226` | 生成最终事件标签的阈值 |
+| M169 域阈值 | `<=30000: 0.718`；`30000--200000: 0.728`；更高密度时按极性少数类 `<0.20: 0.722`、其余 `0.724` | 只按测试时可观察事件流选择阈值 |
 | P0/P0c | 半径 2、相邻 1 个时间箱、最少 3 事件和 5 时间箱、保留分数 0.95 | 过滤弱时空连通簇，同时保留高置信小簇 |
 | P18-global | 不限制事件数、候选下限 0.53、半径 5、连接距离 8、最少 4 时间箱 | 每个稳定弱轨迹组件仅恢复一个最优事件 |
+| P32 轨迹质量加分 | 候选下限 0.60、半径 2、时间箱 50、连接距离 8、最多断 2 箱、最少 4 箱/3 个 seed、加分 0.010、封顶 0.97、残差上限 2.0 | 只给无标签可观测的平滑 seed 轨迹加分，提高边界附近目标的召回 |
 
 M26 的 flow 输出层采用零初始化。因此从 M20 加载时 flow 严格为零、warp 是精确恒等，初始预测不变；训练期再通过同一 `target_id` 的相邻时间箱质心监督逆位移。flow 以 `2.0 * tanh(raw_flow)` 限制在 2 个 bottleneck 单元内，避免异常位移破坏已收敛的记忆状态。
 
@@ -80,13 +92,15 @@ M26 的 flow 输出层采用零初始化。因此从 M20 加载时 flow 严格�
 1. 读取完整原始事件流，按宽度 `50` 的时间箱构建上下文为 5 的时序输入帧。
 2. 事件数不超过 30000 的视频路由到 M10，其余视频使用 M26。
 3. 高密度路由额外以时间偏移 `25` 构造第二个流，原流与偏移流的逐事件概率按 `0.75/0.25` 融合；低密度 M10 路由不执行该步骤。
-4. 按 P6 的密度自适应阈值生成初始二值事件。
+4. 按 M169 的事件数/极性域阈值生成初始二值事件。
 5. 应用 P0 时空连通簇过滤，再应用 P0c 高置信恢复。
 6. 应用 P18-global 弱轨迹恢复，每个符合条件的组件仅恢复一个最优事件。
-7. M124 verifier 在最终阈值化前删除背景概率不低于 `0.90` 的最终组件。
-8. 生成提交时保留原始 `x y t p`，仅写入最终二值 `label`。
+7. P32 在 P18 后、M124 前执行固定轨迹质量加分。
+8. M124 verifier 在最终阈值化前删除背景概率不低于 `0.89` 的最终组件。
+9. 生成提交时保留原始 `x y t p`，仅写入最终二值 `label`。
 
-所有路由条件都只依赖可观察的输入事件数。推理过程中不读取验证标签、目标 ID 或视频名称规则。
+所有路由条件都只依赖可观察的输入事件数、极性、坐标、时间和模型分数。推理过程中不读取验证标签、目标 ID
+或视频名称规则。
 
 ## 已包含权重
 
@@ -97,7 +111,7 @@ M26 的 flow 输出层采用零初始化。因此从 M20 加载时 flow 严格�
 | `checkpoints/m20_attn_dense_views8_epoch_003_seed48.pt` | 固定高密度 M20 模型 | `4B8B2B19EA9D913EE4E52CB21AE52BF945B2B0F3CEFD5CB5AB6F64D51BF49849` |
 | `checkpoints/m26_targetflow_m20e3_epoch_003_seed53.pt` | 固定高密度 M26 模型 | `13F7D4D8AB6BDCAAA98F3F906A7D32E687C17454B88B42B94752EEC04257F7C4` |
 | `checkpoints/m111_phase_specialist_seed72_73_76_average.pt` | M111 三 seed 相位专家平均 | `15FD690E3BB177649F2A995AAF00B947FD6AC0DFB147EA6A9CDF5847B96ADED2` |
-| `checkpoints/m124_m115_long_background_verifier_v1.pkl.gz` | M124 纯背景组件 verifier | `B39A2DD93A2B6B499F558338FCFEE3B7BD20F8CECCFB66499549617E832D1C8B` |
+| `checkpoints/m124_m115_long_background_verifier_v1_threshold089.pkl.gz` | 当前最高方案的 M124 纯背景组件 verifier | `492C7044C22C634A471D883EF8DB6178C7DB6D8F66CF8D85840DC040E58B85B5` |
 
 直接评估当前最高候选需要 M10、M26、M111 和 M124 verifier；P41 是无参数的推理期集成。M20 是 M26 的训练初始化，M4 只在下文的完整重训链条中使用。
 
@@ -109,7 +123,7 @@ EVSOD-main/
 |-- configs/evisseg_evuav.yaml   # 固定配置
 |-- dataset/                     # 数据集目录，不上传 Git
 |-- model/temporal_memory_net.py # ConvGRU、时序自注意力和有界平流对齐
-|-- utils/                       # 全事件流推理、评估器和 M124 verifier
+|-- utils/                       # 全事件流推理、评估器、M124 verifier 和 P32
 |-- train_temporal_memory.py     # M13/M15/M20/M26 训练入口
 |-- test2.py                     # 本地 Challenge 2 验证
 |-- submit_challenge2.py         # 提交 TXT 生成
@@ -202,7 +216,7 @@ dataset/训练集、验证集/
 M10_CKPT="$PROJECT_DIR/checkpoints/m10_dense_views2_epoch_002_seed42.pt"
 M26_CKPT="$PROJECT_DIR/checkpoints/m26_targetflow_m20e3_epoch_003_seed53.pt"
 M111_CKPT="$PROJECT_DIR/checkpoints/m111_phase_specialist_seed72_73_76_average.pt"
-M124_VERIFIER="$PROJECT_DIR/checkpoints/m124_m115_long_background_verifier_v1.pkl.gz"
+M124_VERIFIER="$PROJECT_DIR/checkpoints/m124_m115_long_background_verifier_v1_threshold089.pkl.gz"
 
 python test2.py --config configs/evisseg_evuav.yaml --set \
   DATA.root="$DATA_ROOT" \
@@ -238,10 +252,27 @@ python test2.py --config configs/evisseg_evuav.yaml --set \
   POSTPROCESS.p6_density_threshold_enabled=true \
   POSTPROCESS.p6_event_count_cutoff=30000 \
   POSTPROCESS.p6_low_density_threshold=0.718 \
-  POSTPROCESS.p6_high_density_threshold=0.7226 \
+  POSTPROCESS.p6_polarity_domain_enabled=true \
+  POSTPROCESS.p6_middle_event_count_cutoff=200000 \
+  POSTPROCESS.p6_middle_density_threshold=0.728 \
+  POSTPROCESS.p6_high_polarity_minority_cutoff=0.20 \
+  POSTPROCESS.p6_high_imbalanced_threshold=0.722 \
+  POSTPROCESS.p6_high_balanced_threshold=0.724 \
+  POSTPROCESS.p32_track_quality_bonus_enabled=true \
+  POSTPROCESS.p32_candidate_floor=0.60 \
+  POSTPROCESS.p32_spatial_radius=2 \
+  POSTPROCESS.p32_temporal_bin_size=50 \
+  POSTPROCESS.p32_max_link_distance=8.0 \
+  POSTPROCESS.p32_max_gap_bins=2 \
+  POSTPROCESS.p32_min_track_bins=4 \
+  POSTPROCESS.p32_min_seed_components=3 \
+  POSTPROCESS.p32_bonus=0.010 \
+  POSTPROCESS.p32_max_score_cap=0.97 \
+  POSTPROCESS.p32_max_motion_residual=2.0 \
+  POSTPROCESS.p32_velocity_history_bins=2 \
   POSTPROCESS.m124_background_verifier_enabled=true \
   POSTPROCESS.m124_background_verifier_model_path="$M124_VERIFIER" \
-  POSTPROCESS.m124_background_verifier_threshold=0.90
+  POSTPROCESS.m124_background_verifier_threshold=0.89
 ```
 
 P41 的四项覆盖必须使用 `INFERENCE_TTA.p41_*` 前缀。配置加载会把分组字段展平；若误写为
@@ -250,15 +281,20 @@ P41 的四项覆盖必须使用 `INFERENCE_TTA.p41_*` 前缀。配置加载会�
 预期输出接近：
 
 ```text
-IoU:      0.9425080419
-Acc:      0.9762769938
-Pd:       0.9785804284
-Fa:       4.6129243890e-06
+IoU:      0.9429009557
+Acc:      0.9765975475
+Pd:       0.9787904242
+Fa:       4.5892227865e-06
 Score_Fa: 0.9549185368
-Score:    0.9640370402
+Score:    0.9642995840
 ```
 
-### 1.1 正式 M26/P41 基线回归
+### 1.1 回退候选 A
+
+回退候选保持标准 P6、P32 `min_seed_components=2` 和 M124 `0.90`，完整 Score 为
+`0.9641980199`。它保留在实验日志中用于回归；当前发布和提交使用上文的 B 方案，不混合两套参数。
+
+### 1.2 正式 M26/P41 基线回归
 
 若需要排查环境差异或对比 verifier 增益，将上一条命令中的 M111 五项覆盖和 M124 三项覆盖去掉，
 即可得到正式 M26/P41 基线，预期 `Score=0.9638562171`。M124 配置默认关闭，旧命令无需修改即可保持
@@ -392,18 +428,18 @@ M26_E3="$(find "$M26_ROOT/runs" -type f -name 'epoch_003_seed53.pt' -print -quit
 test -n "$M26_E3"
 ```
 
-将第 1 步中的 `M26_CKPT` 改为 `$M26_E3`，使用完全相同的完整验证命令（包括 P41 与 P18-global）评估重新训练的模型。只有完整验证达到或超过预期时，才可用该新权重替换发布的 M26 checkpoint。
+将第 1 步中的 `M26_CKPT` 改为 `$M26_E3`，使用完全相同的完整验证命令（包括 P41、M169、P18、P32 和 M124）评估重新训练的模型。只有完整验证达到或超过预期时，才可用该新权重替换发布的 M26 checkpoint。
 
 ### 3. 生成 Challenge 2 提交文件
 
 提交必须使用与 **免训练评估** 完全相同的 M10/M26/M111/M124 权重及固定参数，只将验证选项替换为输出目录：
 
 ```bash
-OUTPUT_DIR="$PROJECT_DIR/log/challenge2/m111_m124_current_best"
+OUTPUT_DIR="$PROJECT_DIR/log/challenge2/m187_m169_p32seed3_m124089_current_best"
 M10_CKPT="$PROJECT_DIR/checkpoints/m10_dense_views2_epoch_002_seed42.pt"
 M26_CKPT="$PROJECT_DIR/checkpoints/m26_targetflow_m20e3_epoch_003_seed53.pt"
 M111_CKPT="$PROJECT_DIR/checkpoints/m111_phase_specialist_seed72_73_76_average.pt"
-M124_VERIFIER="$PROJECT_DIR/checkpoints/m124_m115_long_background_verifier_v1.pkl.gz"
+M124_VERIFIER="$PROJECT_DIR/checkpoints/m124_m115_long_background_verifier_v1_threshold089.pkl.gz"
 
 python submit_challenge2.py --config configs/evisseg_evuav.yaml --set \
   DATA.root="$DATA_ROOT" \
@@ -439,13 +475,30 @@ python submit_challenge2.py --config configs/evisseg_evuav.yaml --set \
   POSTPROCESS.p6_density_threshold_enabled=true \
   POSTPROCESS.p6_event_count_cutoff=30000 \
   POSTPROCESS.p6_low_density_threshold=0.718 \
-  POSTPROCESS.p6_high_density_threshold=0.7226 \
+  POSTPROCESS.p6_polarity_domain_enabled=true \
+  POSTPROCESS.p6_middle_event_count_cutoff=200000 \
+  POSTPROCESS.p6_middle_density_threshold=0.728 \
+  POSTPROCESS.p6_high_polarity_minority_cutoff=0.20 \
+  POSTPROCESS.p6_high_imbalanced_threshold=0.722 \
+  POSTPROCESS.p6_high_balanced_threshold=0.724 \
+  POSTPROCESS.p32_track_quality_bonus_enabled=true \
+  POSTPROCESS.p32_candidate_floor=0.60 \
+  POSTPROCESS.p32_spatial_radius=2 \
+  POSTPROCESS.p32_temporal_bin_size=50 \
+  POSTPROCESS.p32_max_link_distance=8.0 \
+  POSTPROCESS.p32_max_gap_bins=2 \
+  POSTPROCESS.p32_min_track_bins=4 \
+  POSTPROCESS.p32_min_seed_components=3 \
+  POSTPROCESS.p32_bonus=0.010 \
+  POSTPROCESS.p32_max_score_cap=0.97 \
+  POSTPROCESS.p32_max_motion_residual=2.0 \
+  POSTPROCESS.p32_velocity_history_bins=2 \
   POSTPROCESS.m124_background_verifier_enabled=true \
   POSTPROCESS.m124_background_verifier_model_path="$M124_VERIFIER" \
-  POSTPROCESS.m124_background_verifier_threshold=0.90
+  POSTPROCESS.m124_background_verifier_threshold=0.89
 
 cd "$OUTPUT_DIR"
-zip -j ../m111_m124_current_best.zip val_*.txt
+zip -j ../m187_m169_p32seed3_m124089_current_best.zip val_*.txt
 ```
 
 ## 引用

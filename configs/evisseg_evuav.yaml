@@ -186,7 +186,21 @@ POSTPROCESS:
   # It is disabled by default so historical inference commands are unchanged.
   m124_background_verifier_enabled: false
   m124_background_verifier_model_path: ""
-  m124_background_verifier_threshold: 0.90
+  m124_background_verifier_threshold: 0.89
+  # P32: fixed, label-free score bonus for seed-supported smooth tracks.
+  # It only reweights observed events and is safe for unlabeled test videos.
+  p32_track_quality_bonus_enabled: false
+  p32_candidate_floor: 0.60
+  p32_spatial_radius: 2
+  p32_temporal_bin_size: 50
+  p32_max_link_distance: 8.0
+  p32_max_gap_bins: 2
+  p32_min_track_bins: 4
+  p32_min_seed_components: 3
+  p32_bonus: 0.010
+  p32_max_score_cap: 0.97
+  p32_max_motion_residual: 2.0
+  p32_velocity_history_bins: 2
   # P6: density-adaptive decision threshold; disabled by default.
   p6_density_threshold_enabled: false
   p6_event_count_cutoff: 100000
@@ -282,6 +296,13 @@ TEMPORAL_FRAME:
   temporal_frame_confidence_calibration_weight: 0.1
   temporal_frame_density_calibration_enabled: false
   temporal_frame_multiscale_motion_enabled: false
+  # M22: label-free polarity temporal-difference input and output-side SSA.
+  # Both branches are zero-initialized and disabled by default.
+  temporal_frame_temporal_diff_enabled: false
+  temporal_frame_temporal_diff_lr_multiplier: 10.0
+  temporal_frame_temporal_diff_freeze_base_enabled: false
+  temporal_frame_ssa_enabled: false
+  temporal_frame_ssa_lr_multiplier: 10.0
   # M6: Gaussian soft labels + Quality Focal Loss
   temporal_frame_gaussian_soft_labels_enabled: false
   temporal_frame_gaussian_sigma: 2.5
@@ -417,6 +438,8 @@ TEMPORAL_MEMORY:
   temporal_memory_phase_specialist_event_count_cutoff: 30000
   temporal_memory_phase_specialist_weight: 0.25
   temporal_memory_phase_specialist_offset: 25
+  # Explicit opt-in for a fixed score blend applied after the M49/P41 route.
+  temporal_memory_phase_specialist_blend_compatible: false
   temporal_memory_init_model_path: ""
   # Training-only P41-equivalent phase translation. Zero keeps the raw grid.
   temporal_memory_training_phase_offset: 0

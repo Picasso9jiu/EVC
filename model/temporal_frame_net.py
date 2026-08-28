@@ -111,6 +111,41 @@ def build_motion_persistence_channels(
     return torch.cat(features, dim=1)
 
 
+def build_polarity_temporal_diff_channels(inputs):
+    """Build label-free polarity-aware temporal difference channels.
+
+    The raw context is stored as negative/positive pairs for each temporal
+    bin, with the centre bin in the middle.  The returned eight channels
+    expose short past/future changes, a longer past trend, polarity imbalance,
+    and total activity change.  They are derived only from the input frame so
+    the branch remains valid for the unlabeled public test videos.
+    """
+    if inputs.ndim != 4:
+        raise ValueError('inputs must have shape [B, C, H, W].')
+    channel_count = int(inputs.shape[1])
+    if channel_count < 10 or channel_count % 2 != 0:
+        raise ValueError('inputs must have an even channel count of at least 10.')
+    context_bins = channel_count // 2
+    centre_bin = context_bins // 2
+    centre_start = centre_bin * 2
+    centre_negative = inputs[:, centre_start]
+    centre_positive = inputs[:, centre_start + 1]
+    features = []
+    for relative_bin in (-1, 1):
+        neighbour_start = (centre_bin + relative_bin) * 2
+        features.append(centre_negative - inputs[:, neighbour_start])
+        features.append(centre_positive - inputs[:, neighbour_start + 1])
+    long_past_start = (centre_bin - 2) * 2
+    features.append(centre_negative - inputs[:, long_past_start])
+    features.append(centre_positive - inputs[:, long_past_start + 1])
+    features.append(centre_positive - centre_negative)
+    features.append(
+        (centre_positive + centre_negative)
+        - (inputs[:, long_past_start] + inputs[:, long_past_start + 1])
+    )
+    return torch.stack(features, dim=1)
+
+
 class ConvNormAct(nn.Module):
     """Three-by-three convolution with batch-size-independent normalization."""
 
@@ -300,6 +335,72 @@ class DensityAdaptiveChannelCalibrator(nn.Module):
         return features * channel_weights
 
 
+class SmearAwareAlignment(nn.Module):
+    """Small output-side residual for directional event smear.
+
+    The branch is deliberately placed immediately before the event head.  Its
+    final projection is zero-initialized, so attaching it to a released
+    checkpoint is an exact identity until the branch is trained.
+    """
+
+    def __init__(self, feature_channels, use_diff=False, hidden=16, strip_kernel=7):
+        super().__init__()
+        feature_channels = int(feature_channels)
+        hidden = int(hidden)
+        strip_kernel = int(strip_kernel)
+        if feature_channels <= 0 or hidden <= 0:
+            raise ValueError('feature_channels and hidden must be positive.')
+        if strip_kernel <= 0 or strip_kernel % 2 == 0:
+            raise ValueError('strip_kernel must be a positive odd integer.')
+        self.use_diff = bool(use_diff)
+        input_channels = feature_channels + (8 if self.use_diff else 0)
+        radius = strip_kernel // 2
+        self.horizontal = nn.Conv2d(
+            input_channels,
+            hidden,
+            kernel_size=(1, strip_kernel),
+            padding=(0, radius),
+            bias=False,
+        )
+        self.vertical = nn.Conv2d(
+            input_channels,
+            hidden,
+            kernel_size=(strip_kernel, 1),
+            padding=(radius, 0),
+            bias=False,
+        )
+        self.square = nn.Conv2d(
+            input_channels,
+            hidden,
+            kernel_size=3,
+            padding=1,
+            bias=False,
+        )
+        self.merge = nn.Conv2d(hidden * 3, feature_channels, kernel_size=1, bias=True)
+        self.residual = nn.Conv2d(feature_channels, feature_channels, kernel_size=1, bias=True)
+        nn.init.zeros_(self.residual.weight)
+        nn.init.zeros_(self.residual.bias)
+
+    def forward(self, decoded_features, diff_features=None):
+        if self.use_diff and diff_features is None:
+            raise ValueError('use_diff requires diff_features in forward.')
+        if not self.use_diff and diff_features is not None:
+            raise ValueError('diff_features supplied but use_diff is False.')
+        inputs = decoded_features
+        if self.use_diff:
+            inputs = torch.cat((decoded_features, diff_features), dim=1)
+        branches = torch.cat(
+            (
+                self.horizontal(inputs),
+                self.vertical(inputs),
+                self.square(inputs),
+            ),
+            dim=1,
+        )
+        merged = self.merge(functional.relu(branches, inplace=False))
+        return self.residual(merged)
+
+
 class TemporalFrameNet(nn.Module):
     """Predict a target logit for every pixel of a metric-time event frame."""
 
@@ -314,6 +415,8 @@ class TemporalFrameNet(nn.Module):
         target_center_enabled=False,
         confidence_head_enabled=False,
         density_calibration_enabled=False,
+        temporal_diff_enabled=False,
+        ssa_enabled=False,
         normalization_max_groups=8,
     ):
         super().__init__()
@@ -347,6 +450,8 @@ class TemporalFrameNet(nn.Module):
         self.target_center_enabled = bool(target_center_enabled)
         self.confidence_head_enabled = bool(confidence_head_enabled)
         self.density_calibration_enabled = bool(density_calibration_enabled)
+        self.temporal_diff_enabled = bool(temporal_diff_enabled)
+        self.ssa_enabled = bool(ssa_enabled)
         self.normalization_max_groups = normalization_max_groups
         width2 = width * 2
         width4 = width * 4
@@ -400,6 +505,17 @@ class TemporalFrameNet(nn.Module):
             )
             nn.init.zeros_(self.local_temporal_context_adapter.weight)
             nn.init.zeros_(self.local_temporal_context_adapter.bias)
+        self.temporal_diff_adapter = None
+        if self.temporal_diff_enabled:
+            self.temporal_diff_adapter = nn.Conv2d(
+                8,
+                width,
+                kernel_size=3,
+                padding=1,
+                bias=True,
+            )
+            nn.init.zeros_(self.temporal_diff_adapter.weight)
+            nn.init.zeros_(self.temporal_diff_adapter.bias)
         self.encoder1 = DownBlock(
             width,
             width2,
@@ -486,6 +602,12 @@ class TemporalFrameNet(nn.Module):
                 feature_channels=width,
                 reduction=16,
             )
+        self.ssa = None
+        if self.ssa_enabled:
+            self.ssa = SmearAwareAlignment(
+                feature_channels=width,
+                use_diff=self.temporal_diff_enabled,
+            )
 
     @property
     def total_input_channels(self):
@@ -542,12 +664,27 @@ class TemporalFrameNet(nn.Module):
             level0 = level0 + self.local_temporal_context_adapter(
                 inputs[:, adapter_offset:context_end]
             )
+        if self.temporal_diff_adapter is not None:
+            diff_inputs = build_polarity_temporal_diff_channels(
+                inputs[:, :self.input_channels]
+            )
+            level0 = level0 + self.temporal_diff_adapter(diff_inputs)
+            legacy_adapter_enabled = True
         if legacy_adapter_enabled:
             level0 = functional.relu(level0, inplace=False)
         level1 = self.encoder1(level0)
         level2 = self.encoder2(level1)
         level3 = self.context(self.encoder3(level2))
         return level0, level1, level2, level3
+
+    def apply_ssa(self, decoded_features, base_input):
+        """Apply the optional output-side residual before ``self.head``."""
+        if self.ssa is None:
+            return decoded_features
+        diff_features = None
+        if self.ssa.use_diff:
+            diff_features = build_polarity_temporal_diff_channels(base_input)
+        return decoded_features + self.ssa(decoded_features, diff_features)
 
     def forward(
         self,
@@ -564,6 +701,7 @@ class TemporalFrameNet(nn.Module):
                 decoded0,
                 inputs[:, :self.input_channels],
             )
+        decoded0 = self.apply_ssa(decoded0, inputs[:, :self.input_channels])
         logits = self.head(decoded0)
 
         confidence_logits = None

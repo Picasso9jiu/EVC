@@ -316,6 +316,8 @@ class BidirectionalTemporalMemoryNet(nn.Module):
         local_temporal_context_enabled=False,
         local_temporal_context_kernel_size=11,
         density_calibration_enabled=False,
+        temporal_diff_enabled=False,
+        ssa_enabled=False,
         confidence_head_enabled=False,
         target_center_enabled=False,
         target_level_enabled=False,
@@ -364,11 +366,15 @@ class BidirectionalTemporalMemoryNet(nn.Module):
                 1 if bool(local_temporal_context_enabled) else 0
             ),
             density_calibration_enabled=bool(density_calibration_enabled),
+            temporal_diff_enabled=bool(temporal_diff_enabled),
+            ssa_enabled=bool(ssa_enabled),
             confidence_head_enabled=bool(confidence_head_enabled),
             target_center_enabled=bool(target_center_enabled),
             normalization_max_groups=normalization_max_groups,
         )
         self.local_temporal_context_enabled = bool(local_temporal_context_enabled)
+        self.temporal_diff_enabled = bool(temporal_diff_enabled)
+        self.ssa_enabled = bool(ssa_enabled)
         self.local_temporal_context_kernel_size = int(
             local_temporal_context_kernel_size
         )
@@ -899,6 +905,10 @@ class BidirectionalTemporalMemoryNet(nn.Module):
                     'density calibration requires base_input in _decode.'
                 )
             decoded0 = self.base.density_calibrator(decoded0, base_input)
+        if self.base.ssa_enabled:
+            if base_input is None:
+                raise ValueError('SSA requires base_input in _decode.')
+            decoded0 = self.base.apply_ssa(decoded0, base_input)
         logits = self.base.head(decoded0)
         objectness_outputs = None
         if self.objectness_gate_enabled:

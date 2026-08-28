@@ -22,6 +22,7 @@ from utils.inference_chunks import (
     evaluation_batch_from_sample,
 )
 from utils.postprocess import ChallengePostprocessor
+from utils.track_quality_bonus import P32TrackQualityBonus
 from utils.spatial_tta import HorizontalFlipTTAConfig
 from utils.temporal_frame_inference import (
     TemporalFrameInferenceConfig,
@@ -199,11 +200,16 @@ if __name__ == "__main__":
                 spatial_phase_tta_config.enabled
                 or temporal_memory_config.dense_specialist_enabled
                 or temporal_memory_config.fine_time_expert_enabled
-                or temporal_memory_config.has_blend_model
+                or (
+                    temporal_memory_config.has_blend_model
+                    and not temporal_memory_config.phase_specialist_blend_compatible
+                )
             ):
                 raise ValueError(
                     'M49 phase specialist must not be combined with other '
-                    'high-density expert or spatial-phase routes.'
+                    'high-density expert or spatial-phase routes. Set '
+                    'TEMPORAL_MEMORY.temporal_memory_phase_specialist_blend_compatible=true '
+                    'only for a fixed post-M49 score blend.'
                 )
     if threshold_policy.enabled and cfg.batch_size != 1:
         raise ValueError("P6 density-adaptive threshold requires batch_size=1.")
@@ -399,8 +405,14 @@ if __name__ == "__main__":
     else:
         print("M124 background verifier: disabled")
     postprocess_stats = postprocessor.new_stats()
+    p32_track_bonus = P32TrackQualityBonus.from_cfg(
+        cfg,
+        PREDICTION_THRESHOLD,
+    )
+    p32_track_bonus_stats = p32_track_bonus.new_stats()
     threshold_usage = {}
     print("postprocessor:", postprocessor.describe())
+    print("P32 track-quality bonus:", p32_track_bonus.describe())
     evaluator = evalute(cfg)
     sample_number = 0
     p8_partitioned_videos = 0
@@ -703,6 +715,15 @@ if __name__ == "__main__":
                 batch["locs"],
             )
             postprocess_stats.merge(batch_postprocess_stats)
+            batch_p32_track_bonus = (
+                P32TrackQualityBonus.from_cfg(cfg, batch_threshold)
+                if threshold_policy.enabled else p32_track_bonus
+            )
+            predictions, batch_p32_track_bonus_stats = batch_p32_track_bonus.apply(
+                predictions,
+                batch["locs"],
+            )
+            p32_track_bonus_stats.merge(batch_p32_track_bonus_stats)
             if background_verifier is not None:
                 verifier_result = background_verifier.apply(
                     raw_predictions,
@@ -747,6 +768,15 @@ if __name__ == "__main__":
                     batch["locs"],
                 )
                 postprocess_stats.merge(batch_postprocess_stats)
+                batch_p32_track_bonus = (
+                    P32TrackQualityBonus.from_cfg(cfg, batch_threshold)
+                    if threshold_policy.enabled else p32_track_bonus
+                )
+                predictions, batch_p32_track_bonus_stats = batch_p32_track_bonus.apply(
+                    predictions,
+                    batch["locs"],
+                )
+                p32_track_bonus_stats.merge(batch_p32_track_bonus_stats)
                 if threshold_policy.enabled:
                     # Semantic metrics are computed after the loop with one scalar
                     # threshold, so persist the selected per-video decision here.
@@ -763,6 +793,7 @@ if __name__ == "__main__":
 
     pbar.close()
     print("postprocess result:", postprocess_stats.summary())
+    print("P32 track-quality bonus result:", p32_track_bonus_stats.summary())
     if chunk_config.enabled and not full_stream_only:
         print(
             "P8 random chunk result: {} high-density videos, {} chunk forwards".format(
